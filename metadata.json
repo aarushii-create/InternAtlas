@@ -1,0 +1,6 @@
+{
+  "name": "AI Internship Scout",
+  "description": "Personal internship scout that monitors job boards around the clock, evaluates roles with a 2-layer RAG pipeline, and provides instant multi-tenant alerts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_PROCESSING"]
+}
