@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   FileText,
   Upload,
@@ -16,6 +16,7 @@ import {
   ShieldCheck,
   RefreshCw,
   Eye,
+  Trash2,
 } from 'lucide-react';
 import { User, ParsedResumeData, Resume } from '../types';
 
@@ -25,64 +26,13 @@ interface ResumeIngestionProps {
   onResumeSaved?: () => void;
 }
 
-const SAMPLE_RESUMES = [
-  {
-    title: 'Alex Rivera - Stanford CS Resume',
-    content: `Alex Rivera | alex.rivera@stanford.edu | github.com/arivera
-Education: B.S. in Computer Science, Stanford University (GPA 3.92, Class of 2026)
-Coursework: Distributed Systems, Compilers, Machine Learning, Operating Systems, Data Structures & Algorithms.
-
-Technical Skills:
-Languages: C++, Python, TypeScript, Go, SQL, Rust
-Frameworks: React, Express, PyTorch, Docker, Kubernetes, Tailwind, PostgreSQL, pgvector
-Concepts: Distributed Consensus, High-Performance Networking, Vector Embeddings, RAG Architectures
-
-Experience:
-Systems Engineering Intern @ Databricks (Summer 2025)
-- Engineered a C++ query optimizer caching layer that reduced P99 latency by 42% across 100,000+ daily queries.
-- Built automated benchmark harness in Python and Docker to measure vector search precision on 768-dim datasets.
-
-Software Engineering Intern @ Stripe (Summer 2024)
-- Architected idempotency middleware for payment dispatches handling 15,000 requests/sec with zero duplicate executions.
-- Refactored legacy Go microservices, improving throughput by 28% and eliminating memory leaks.
-
-Projects:
-AI Internship Scout (2026): Multi-tenant 2-layer RAG matching engine using pgvector and deterministic local processing.
-Distributed Key-Value Store (2025): Built Raft consensus algorithm in Go with 99.99% fault tolerance in chaos testing.`,
-  },
-  {
-    title: 'Jordan Chen - UC Berkeley EECS Resume',
-    content: `Jordan Chen | jordan.chen@berkeley.edu | github.com/jchen-eecs
-Education: B.S. in Electrical Engineering & Computer Sciences, UC Berkeley (GPA 3.88, Class of 2026)
-
-Technical Skills:
-Languages: Python, Java, C, C++, TypeScript, SQL
-AI/ML: PyTorch, TensorFlow, HuggingFace, CUDA, Vector Databases, ONNX
-Tools: Git, Linux, Docker, AWS (S3, EC2, Lambda), Redis, FastAPI
-
-Experience:
-AI Research Intern @ OpenAI (Summer 2025)
-- Fine-tuned 7B parameter Transformer models for code generation, achieving a 14% improvement on HumanEval benchmark.
-- Implemented FlashAttention-2 GPU kernel integrations in PyTorch to cut training memory footprint by 35%.
-
-Backend Developer Intern @ Goldman Sachs (Summer 2024)
-- Developed low-latency FIX protocol trade ingestion engine handling $50M+ daily volume.
-- Migrated legacy Java monolith services to Dockerized Spring Boot microservices with Kafka streams.
-
-Projects:
-GPU-Accelerated Neural Engine: CUDA implementation of convolution operations with 3.2x speedup over PyTorch CPU.
-Real-Time Market Data Feed: Low-latency WebSocket parser in Rust processing 50,000 tick updates/sec.`,
-  },
-];
-
 export const ResumeIngestion: React.FC<ResumeIngestionProps> = ({
   currentUser,
   authToken,
   onResumeSaved,
 }) => {
-  const [selectedSample, setSelectedSample] = useState<number | null>(0);
-  const [resumeText, setResumeText] = useState<string>(SAMPLE_RESUMES[0].content);
-  const [resumeTitle, setResumeTitle] = useState<string>(SAMPLE_RESUMES[0].title);
+  const [resumeText, setResumeText] = useState<string>('');
+  const [resumeTitle, setResumeTitle] = useState<string>('');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
 
   const [isParsing, setIsParsing] = useState<boolean>(false);
@@ -103,19 +53,33 @@ export const ResumeIngestion: React.FC<ResumeIngestionProps> = ({
   // DB Persistence
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [savedResume, setSavedResume] = useState<Resume | null>(null);
+  const [savedResumes, setSavedResumes] = useState<Resume[]>([]);
   const [saveSuccessMsg, setSaveSuccessMsg] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const refreshSavedResumes = async () => {
+    const response = await fetch('/api/resumes');
+    if (!response.ok) throw new Error('Could not load your saved resumes.');
+    const data = await response.json();
+    setSavedResumes(data.resumes);
+  };
+
+  useEffect(() => {
+    void refreshSavedResumes().catch((error: unknown) => {
+      setParsingError(error instanceof Error ? error.message : 'Could not load your saved resumes.');
+    });
+  }, []);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
       setSelectedFile(file);
       setResumeTitle(file.name);
-      setSelectedSample(null);
+      setParsedData(null);
+      setVectors(null);
 
-      // If text file, read content preview
-      if (file.type === 'text/plain' || file.name.endsWith('.txt') || file.name.endsWith('.md')) {
+      if (file.type === 'text/plain' || file.type === 'text/markdown' || /\.(txt|md)$/i.test(file.name)) {
         const reader = new FileReader();
         reader.onload = (event) => {
           if (event.target?.result) {
@@ -124,16 +88,9 @@ export const ResumeIngestion: React.FC<ResumeIngestionProps> = ({
         };
         reader.readAsText(file);
       } else {
-        setResumeText(`[Binary File Selected: ${file.name} (${(file.size / 1024).toFixed(1)} KB)]\nParsing pipeline will process PDF/DocX text using binary text extractors on backend.`);
+        setResumeText('');
       }
     }
-  };
-
-  const handleSampleSelect = (index: number) => {
-    setSelectedSample(index);
-    setSelectedFile(null);
-    setResumeTitle(SAMPLE_RESUMES[index].title);
-    setResumeText(SAMPLE_RESUMES[index].content);
   };
 
   // Run the local deterministic parsing pipeline.
@@ -176,9 +133,7 @@ export const ResumeIngestion: React.FC<ResumeIngestionProps> = ({
 
       setParsedData(data.parsedData);
       setVectors(data.vectors);
-      if (data.rawText && selectedFile) {
-        setResumeText(data.rawText);
-      }
+      if (data.rawText) setResumeText(data.rawText);
     } catch (err: any) {
       setParsingError(err.message || 'Error executing AI resume parsing');
     } finally {
@@ -227,12 +182,26 @@ export const ResumeIngestion: React.FC<ResumeIngestionProps> = ({
       }
 
       setSavedResume(data.resume);
+      await refreshSavedResumes();
       setSaveSuccessMsg('Resume and 3 structural vectors persisted to database successfully!');
       if (onResumeSaved) onResumeSaved();
     } catch (err: any) {
       setParsingError(err.message || 'Error saving resume to database');
     } finally {
       setIsSaving(false);
+    }
+  };
+
+  const handleDeleteResume = async (resumeId: string) => {
+    if (!window.confirm('Permanently delete this saved resume and its derived match records?')) return;
+    try {
+      const response = await fetch(`/api/resumes/${encodeURIComponent(resumeId)}`, { method: 'DELETE' });
+      if (!response.ok) throw new Error('Could not delete this resume.');
+      setSavedResumes((resumes) => resumes.filter((resume) => resume.id !== resumeId));
+      if (savedResume?.id === resumeId) setSavedResume(null);
+      onResumeSaved?.();
+    } catch (error: unknown) {
+      setParsingError(error instanceof Error ? error.message : 'Could not delete this resume.');
     }
   };
 
@@ -247,70 +216,50 @@ export const ResumeIngestion: React.FC<ResumeIngestionProps> = ({
             </div>
             <div>
               <h2 className="text-lg font-bold text-slate-100 flex items-center gap-2">
-                Phase 3: Resume Ingestion & Structural Vectorization
+                Resume text extraction
               </h2>
               <p className="text-xs text-slate-400">
-                Local extraction into modular JSON schemas and 768-dimensional multi-vector embeddings.
+                Local rule-based extraction only. The parser does not invent missing experience, projects, education, or metrics.
               </p>
             </div>
           </div>
 
           <span className="px-3 py-1 bg-emerald-500/10 border border-emerald-500/30 rounded-xl text-emerald-400 text-xs font-mono font-bold flex items-center gap-1.5 self-start sm:self-auto">
-            <Sparkles className="w-3.5 h-3.5" /> Structured Output Schema Active
+            <ShieldCheck className="w-3.5 h-3.5" /> Processed locally; not sent to an AI provider
           </span>
         </div>
 
-        {/* File Input & Sample Preset Selection Bar */}
+        {/* File Input */}
         <div className="space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="text-xs font-bold text-slate-300">1. Select Candidate Resume Source:</span>
+            <span className="text-xs font-bold text-slate-300">Upload a resume or paste its text:</span>
             <div className="flex items-center gap-2">
               <button
                 onClick={() => fileInputRef.current?.click()}
                 className="px-3 py-1.5 bg-indigo-600/20 hover:bg-indigo-600/30 border border-indigo-500/40 text-indigo-300 text-xs font-semibold rounded-xl flex items-center gap-1.5 transition-all cursor-pointer"
               >
                 <Upload className="w-3.5 h-3.5" />
-                <span>Upload PDF / DocX / TXT File</span>
+                <span>Upload PDF / DOCX / TXT / MD</span>
               </button>
               <input
                 type="file"
                 ref={fileInputRef}
                 onChange={handleFileChange}
-                accept=".pdf,.docx,.doc,.txt,.md"
+                accept=".pdf,.docx,.txt,.md"
                 className="hidden"
               />
             </div>
           </div>
-
-          {/* Preset Buttons */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            {SAMPLE_RESUMES.map((sample, idx) => (
-              <button
-                key={idx}
-                type="button"
-                onClick={() => handleSampleSelect(idx)}
-                className={`p-3 rounded-2xl border text-left space-y-1 transition-all cursor-pointer ${
-                  selectedSample === idx
-                    ? 'bg-indigo-600/20 border-indigo-500 text-slate-100 shadow-md'
-                    : 'bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700'
-                }`}
-              >
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-indigo-300">{sample.title}</span>
-                  {selectedSample === idx && <CheckCircle2 className="w-3.5 h-3.5 text-indigo-400" />}
-                </div>
-                <span className="text-[10px] text-slate-500 block truncate font-mono">
-                  {sample.content.slice(0, 80)}...
-                </span>
-              </button>
-            ))}
-          </div>
+          <p className="text-[11px] text-slate-500">
+            Files are limited to 10 MB. Your resume is parsed on this server and is not submitted to Gemini or another AI provider.
+            {currentUser && <> This resume will be saved to {currentUser.fullName}&apos;s account.</>}
+          </p>
         </div>
 
         {/* Text Area Content Box */}
         <div className="space-y-2">
           <div className="flex items-center justify-between text-xs">
-            <label className="font-semibold text-slate-300">Unstructured Resume Raw Text Payload</label>
+            <label className="font-semibold text-slate-300">Resume text</label>
             <span className="font-mono text-slate-500">{resumeText.length} characters</span>
           </div>
 
@@ -319,22 +268,22 @@ export const ResumeIngestion: React.FC<ResumeIngestionProps> = ({
             value={resumeText}
             onChange={(e) => {
               setResumeText(e.target.value);
-              setSelectedSample(null);
+              setSelectedFile(null);
             }}
-            placeholder="Paste raw unstructured resume text or upload PDF/DocX file..."
+            placeholder="Paste resume text or choose a supported file above..."
             className="w-full bg-slate-950 border border-slate-800 text-slate-200 font-mono text-xs p-3 rounded-2xl focus:border-indigo-500 focus:outline-none"
           />
         </div>
 
-        {/* AI Parsing Action Button */}
+        {/* Local parsing action */}
         <div className="flex items-center justify-between pt-2 border-t border-slate-800">
           <p className="text-xs text-slate-400">
-            Runs structured JSON parsing plus three deterministic structural vectors.
+            Extracts explicitly labeled content and creates local deterministic vectors.
           </p>
 
           <button
             onClick={handleParseResume}
-            disabled={isParsing || !resumeText.trim()}
+            disabled={isParsing || (!selectedFile && !resumeText.trim())}
             className="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-bold text-xs rounded-xl flex items-center gap-2 transition-all shadow-lg shadow-indigo-600/20 cursor-pointer"
           >
             {isParsing ? (
@@ -350,6 +299,40 @@ export const ResumeIngestion: React.FC<ResumeIngestionProps> = ({
             )}
           </button>
         </div>
+      </div>
+
+      <div className="rounded-2xl border border-slate-800 bg-slate-900 p-4 space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <h3 className="text-sm font-semibold text-slate-200">Your saved resumes</h3>
+          <button
+            type="button"
+            onClick={() => void refreshSavedResumes().catch((error: unknown) => {
+              setParsingError(error instanceof Error ? error.message : 'Could not load your saved resumes.');
+            })}
+            className="text-xs text-indigo-300 hover:text-indigo-200"
+          >
+            Refresh
+          </button>
+        </div>
+        {savedResumes.length === 0 ? (
+          <p className="text-xs text-slate-500">No resumes are saved to this account.</p>
+        ) : (
+          <ul className="divide-y divide-slate-800">
+            {savedResumes.map((resume) => (
+              <li key={resume.id} className="flex items-center justify-between gap-3 py-2">
+                <span className="min-w-0 truncate text-xs text-slate-300">{resume.title}</span>
+                <button
+                  type="button"
+                  onClick={() => void handleDeleteResume(resume.id)}
+                  aria-label={`Delete ${resume.title}`}
+                  className="shrink-0 rounded-lg p-2 text-rose-300 hover:bg-rose-500/10"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
 
       {/* Error Alert */}
@@ -377,6 +360,12 @@ export const ResumeIngestion: React.FC<ResumeIngestionProps> = ({
               <Layers className="w-5 h-5 text-cyan-400" />
               <h3 className="text-base font-bold text-slate-100">Structured Data & Multi-Vector Extraction</h3>
             </div>
+            <p className="text-xs text-slate-400">
+              Extracted fields are based on text present in the document. No missing values are filled with sample candidate data.
+              {parsedData.inferences && parsedData.inferences.length > 0
+                ? ` Inferred fields: ${parsedData.inferences.join(', ')}.`
+                : ' No inferred fields were added.'}
+            </p>
 
             <div className="flex items-center gap-2">
               <button
@@ -480,7 +469,7 @@ export const ResumeIngestion: React.FC<ResumeIngestionProps> = ({
           {/* TAB 1: Skills */}
           {activeTab === 'skills' && (
             <div className="space-y-3 animate-fadeIn">
-              <span className="text-xs font-bold text-slate-300 block">Extracted Technical Skills & Frameworks:</span>
+              <span className="text-xs font-bold text-slate-300 block">Text extracted from the skills section:</span>
               <div className="flex flex-wrap gap-2">
                 {parsedData.skills.map((skill, idx) => (
                   <span
@@ -491,6 +480,7 @@ export const ResumeIngestion: React.FC<ResumeIngestionProps> = ({
                   </span>
                 ))}
               </div>
+              {parsedData.skills.length === 0 && <p className="text-xs text-slate-500">No skills section was identified.</p>}
             </div>
           )}
 
@@ -508,6 +498,7 @@ export const ResumeIngestion: React.FC<ResumeIngestionProps> = ({
                     {exp.highlights.map((h, hIdx) => (
                       <li key={hIdx}>{h}</li>
                     ))}
+                    {parsedData.experience.length === 0 && <p className="text-xs text-slate-500">No clearly labeled role and employer entries were identified.</p>}
                   </ul>
 
                   {exp.technologies && exp.technologies.length > 0 && (
@@ -545,7 +536,7 @@ export const ResumeIngestion: React.FC<ResumeIngestionProps> = ({
 
                   {proj.outcomes && proj.outcomes.length > 0 && (
                     <div className="space-y-1 border-t border-slate-900 pt-2">
-                      <span className="text-[10px] font-mono text-emerald-400 block font-bold">Key Outcomes:</span>
+                      <span className="text-[10px] font-mono text-emerald-400 block font-bold">Resume bullet text:</span>
                       <ul className="list-disc list-inside text-[11px] text-slate-400">
                         {proj.outcomes.map((out, oIdx) => (
                           <li key={oIdx}>{out}</li>
@@ -586,7 +577,9 @@ export const ResumeIngestion: React.FC<ResumeIngestionProps> = ({
                 <div className="p-3 bg-slate-950 rounded-2xl border border-indigo-500/30 space-y-1">
                   <span className="text-[10px] text-slate-400 block">Years Experience</span>
                   <span className="text-sm font-bold text-indigo-400 font-mono">
-                    {parsedData.metrics.totalYearsExperience ?? 1} yrs
+                    {parsedData.metrics.totalYearsExperience === undefined
+                      ? 'Not stated'
+                      : `${parsedData.metrics.totalYearsExperience} yrs`}
                   </span>
                 </div>
               </div>
@@ -600,6 +593,9 @@ export const ResumeIngestion: React.FC<ResumeIngestionProps> = ({
                     </span>
                   ))}
                 </div>
+                {parsedData.metrics.impactKeywords.length === 0 && (
+                  <p className="text-xs text-slate-500">No metric or keyword values are inferred by this parser.</p>
+                )}
               </div>
             </div>
           )}
@@ -619,6 +615,7 @@ export const ResumeIngestion: React.FC<ResumeIngestionProps> = ({
                   </div>
                 </div>
               ))}
+              {parsedData.education.length === 0 && <p className="text-xs text-slate-500">No explicit degree, GPA, or graduation-year details were identified.</p>}
             </div>
           )}
 

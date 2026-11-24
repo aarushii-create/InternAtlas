@@ -321,7 +321,8 @@ export async function runScraperTestSuite(): Promise<TestSuiteReport> {
 
       const dbJob: Job = {
         id: 'job-unit-test-01',
-        source: rawJob.source,
+        source: rawJob.source === 'greenhouse' || rawJob.source === 'lever' ? rawJob.source : 'custom',
+        atsProvider: rawJob.source,
         externalId: rawJob.externalId,
         dedupHash: 'gh-stripe-infra-2026-unit-hash',
         company: rawJob.company,

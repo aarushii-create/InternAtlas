@@ -84,12 +84,16 @@ export const ProductionUnifiedDashboard: React.FC = () => {
   const [runningBenchmark, setRunningBenchmark] = useState<boolean>(false);
   const [benchmarkResult, setBenchmarkResult] = useState<E2ELoadStressBenchmark | null>(null);
 
+  const getAuthHeaders = () => ({});
+
   // Fetch Dashboard Overview
   const fetchDashboardData = async () => {
     try {
       setLoading(true);
       setError(null);
-      const res = await fetch('/api/dashboard/overview');
+      const res = await fetch('/api/dashboard/overview', {
+        headers: getAuthHeaders(),
+      });
       if (!res.ok) throw new Error(`HTTP Error: ${res.statusText}`);
       const payload: DashboardOverviewPayload = await res.json();
       setData(payload);
@@ -110,20 +114,22 @@ export const ProductionUnifiedDashboard: React.FC = () => {
     try {
       const res = await fetch(`/api/dashboard/match-status/${jobId}`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+        },
         body: JSON.stringify({ applicationStatus: newStatus }),
       });
-      if (res.ok) {
-        setData((prev) => {
-          if (!prev) return prev;
-          return {
-            ...prev,
-            topMatches: prev.topMatches.map((m) => (m.jobId === jobId ? { ...m, applicationStatus: newStatus } : m)),
-          };
-        });
-        if (selectedMatch && selectedMatch.jobId === jobId) {
-          setSelectedMatch((prev) => (prev ? { ...prev, applicationStatus: newStatus } : null));
-        }
+      if (!res.ok) throw new Error(`Application status update failed (${res.status})`);
+      setData((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          topMatches: prev.topMatches.map((m) => (m.jobId === jobId ? { ...m, applicationStatus: newStatus } : m)),
+        };
+      });
+      if (selectedMatch && selectedMatch.jobId === jobId) {
+        setSelectedMatch((prev) => (prev ? { ...prev, applicationStatus: newStatus } : null));
       }
     } catch (err) {
       console.error('Failed to update status:', err);
@@ -138,11 +144,15 @@ export const ProductionUnifiedDashboard: React.FC = () => {
       setPrefsSuccessMsg(null);
       const res = await fetch('/api/dashboard/target-parameters', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+        },
         body: JSON.stringify(tempPrefs),
       });
       if (!res.ok) throw new Error('Failed to update target parameters');
       setPrefsSuccessMsg('Target parameters saved successfully! Match threshold updated.');
+      await fetchDashboardData();
       setTimeout(() => setPrefsSuccessMsg(null), 4000);
     } catch (err: any) {
       alert(err.message || 'Error saving parameters');
@@ -321,7 +331,9 @@ export const ProductionUnifiedDashboard: React.FC = () => {
                 <Cpu className="w-3.5 h-3.5 text-amber-400" />
                 Pipeline Latency
               </div>
-              <div className="text-2xl font-black text-amber-300 mt-1">{data.systemMetrics.pipelineLatencyMs}ms</div>
+              <div className="text-2xl font-black text-amber-300 mt-1">
+                {data.systemMetrics.pipelineLatencyMs === null ? 'Not measured' : `${data.systemMetrics.pipelineLatencyMs}ms`}
+              </div>
               <div className="text-[10px] text-slate-400">Sub-vector Cosine Match</div>
             </div>
 
@@ -517,6 +529,15 @@ export const ProductionUnifiedDashboard: React.FC = () => {
                             <span className="text-[10px] text-slate-400">
                               via {match.atsProvider} • {match.location} ({match.locationType})
                             </span>
+                            {match.dataOrigin && match.dataOrigin !== 'live' && (
+                              <span className={`px-2 py-0.5 rounded border text-[9px] font-bold ${
+                                match.dataOrigin === 'demo'
+                                  ? 'text-amber-300 bg-amber-950/40 border-amber-800/60'
+                                  : 'text-slate-300 bg-slate-800 border-slate-700'
+                              }`}>
+                                {match.dataOrigin === 'demo' ? 'DEMO POSTING' : 'MANUAL LISTING'}
+                              </span>
+                            )}
                           </div>
 
                           <h3 className="text-lg font-extrabold text-white hover:text-indigo-300 transition-colors flex items-center gap-2">
@@ -856,11 +877,13 @@ export const ProductionUnifiedDashboard: React.FC = () => {
                   <div>
                     <h3 className="text-base font-bold text-white flex items-center gap-2">
                       <FileText className="w-4 h-4 text-indigo-400" />
-                      {data.resumeComponentsSummary.title}
+                      {data.resumeComponentsSummary?.title ?? 'No saved resume'}
                     </h3>
                     <p className="text-xs text-slate-400 mt-0.5">
-                      Sub-vector embeddings: 768-dim float • Status:{' '}
-                      <span className="text-emerald-400 font-semibold">{data.resumeComponentsSummary.embeddingsStatus}</span>
+                      {data.resumeComponentsSummary
+                        ? <>Sub-vector embeddings: {data.resumeComponentsSummary.subVectorDimensions}-dim float • Status:{' '}
+                          <span className="text-emerald-400 font-semibold">{data.resumeComponentsSummary.embeddingsStatus}</span></>
+                        : 'Upload a resume to generate match results.'}
                     </p>
                   </div>
 
@@ -873,7 +896,7 @@ export const ProductionUnifiedDashboard: React.FC = () => {
                 <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-2">
                   <span className="text-xs font-bold text-white block">Indexed Technical Skills</span>
                   <div className="flex flex-wrap gap-1.5">
-                    {data.resumeComponentsSummary.topSkills.map((skill) => (
+                    {(data.resumeComponentsSummary?.topSkills ?? []).map((skill) => (
                       <span
                         key={skill}
                         className="px-2.5 py-1 bg-slate-900 text-slate-200 text-xs font-mono rounded-lg border border-slate-800 flex items-center gap-1.5"

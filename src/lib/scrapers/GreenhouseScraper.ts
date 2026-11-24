@@ -12,6 +12,7 @@ import {
   extractStatedRequirements,
   extractInformalBarHints,
 } from '../normalizer';
+import { fetchAtsResponse, parseAtsJson, parsePostedAt } from './atsHttp';
 
 export interface GreenhouseBoardResponse {
   jobs: RawGreenhouseJob[];
@@ -28,29 +29,15 @@ export class GreenhouseScraper {
     const company = companyDisplayName || formatCompanyName(boardToken);
     const url = `${this.baseUrl}/${encodeURIComponent(boardToken)}/jobs?content=true`;
 
-    try {
-      const response = await fetch(url, {
-        headers: {
-          Accept: 'application/json',
-          'User-Agent': 'AI-Internship-Scout/1.0',
-        },
-      });
-
-      if (!response.ok) {
-        console.warn(`Greenhouse API request returned.`);
-        return [];
-      }
-
-      const data: GreenhouseBoardResponse = await response.json();
-      if (!data.jobs || !Array.isArray(data.jobs)) {
-        return [];
-      }
-
-      return data.jobs.map((job) => this.normalizeJob(job, company));
-    } catch (err: any) {
-      console.warn(`Network error fetching Greenhouse board.`);
-      return [];
-    }
+    const response = await fetchAtsResponse('greenhouse', url, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'InternAtlas/1.0 (job-board integration)',
+      },
+    });
+    const data = await parseAtsJson<GreenhouseBoardResponse>(response, 'greenhouse');
+    if (!Array.isArray(data.jobs)) throw new Error('Greenhouse returned an invalid job-board payload.');
+    return data.jobs.map((job) => this.normalizeJob(job, company));
   }
 
   /**
@@ -59,13 +46,13 @@ export class GreenhouseScraper {
   public normalizeJob(raw: RawGreenhouseJob, companyName: string): NormalizedAtsJob {
     const rawDescription = raw.content || '';
     const cleanDescription = sanitizeHtml(rawDescription);
-    const location = raw.location?.name || 'San Francisco, CA';
-    const jobTitle = raw.title || 'Software Engineering Intern';
+    const location = raw.location?.name || 'Location not specified';
+    const jobTitle = raw.title || '';
     const isRemote = detectRemote(jobTitle, location, cleanDescription);
     const externalId = String(raw.id);
-    const directApplyUrl = raw.absolute_url || `https://boards.greenhouse.io/${companyName.toLowerCase().replace(/\s+/g, '')}/jobs/${externalId}`;
+    const directApplyUrl = raw.absolute_url || '';
     const reqId = extractReqId(raw.requisition_id || raw.id, directApplyUrl, rawDescription);
-    const postedAt = raw.updated_at || new Date().toISOString();
+    const postedAt = parsePostedAt(raw.updated_at);
 
     const statedRequirements = extractStatedRequirements(cleanDescription || jobTitle);
     const informalBar = extractInformalBarHints(companyName, jobTitle, cleanDescription);

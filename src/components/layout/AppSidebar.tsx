@@ -44,7 +44,7 @@ interface AppSidebarProps {
   onOpenOnboarding: () => void;
   onLogout: () => void;
   matchesCount?: number;
-  unreadAlertsCount?: number;
+  alertsSentTodayCount?: number;
 }
 
 export const AppSidebar: React.FC<AppSidebarProps> = ({
@@ -60,8 +60,8 @@ export const AppSidebar: React.FC<AppSidebarProps> = ({
   onOpenAuthModal,
   onOpenOnboarding,
   onLogout,
-  matchesCount = 28,
-  unreadAlertsCount = 3,
+  matchesCount = 0,
+  alertsSentTodayCount = 0,
 }) => {
   const navItems: {
     id: MainNavTab;
@@ -100,7 +100,7 @@ export const AppSidebar: React.FC<AppSidebarProps> = ({
       id: 'alerts',
       label: 'Alerts & Channels',
       icon: Bell,
-      badge: unreadAlertsCount > 0 ? unreadAlertsCount : undefined,
+      badge: alertsSentTodayCount > 0 ? alertsSentTodayCount : undefined,
       badgeColor: 'bg-amber-500/20 text-amber-300 border-amber-500/30',
     },
     {
@@ -243,7 +243,7 @@ export const AppSidebar: React.FC<AppSidebarProps> = ({
               <span className="text-[11px] font-bold text-indigo-300 flex items-center gap-1.5">
                 <Target className="w-3.5 h-3.5" /> Target Onboarding
               </span>
-              <span className="text-[10px] text-slate-400 font-mono">Stanford '26</span>
+              <span className="text-[10px] text-slate-400 font-mono">Saved preferences</span>
             </div>
             <p className="text-[11px] text-slate-400 leading-relaxed mb-2.5">
               Refine role queries, location bounds, and minimum match threshold.

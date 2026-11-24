@@ -93,6 +93,14 @@ export const JobDetailDrawer: React.FC<JobDetailDrawerProps> = ({
                 )}
                 <span>•</span>
                 <span className="text-slate-400 uppercase">{match.atsProvider}</span>
+                {match.dataOrigin && match.dataOrigin !== 'live' && (
+                  <>
+                    <span>•</span>
+                    <span className={match.dataOrigin === 'demo' ? 'text-amber-300' : 'text-slate-300'}>
+                      {match.dataOrigin === 'demo' ? 'Demo posting' : 'Manual listing'}
+                    </span>
+                  </>
+                )}
               </div>
             </div>
           </div>

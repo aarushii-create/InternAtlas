@@ -55,8 +55,16 @@ export class NotificationDispatcher {
     return [...this.history].slice(0, limit);
   }
 
+  public getHistoryForCandidate(candidateId: string, limit = 100): AlertDispatchRecord[] {
+    return this.history.filter((record) => record.candidateId === candidateId).slice(0, limit);
+  }
+
   public clearHistory(): void {
     this.history = [];
+  }
+
+  public clearHistoryForCandidate(candidateId: string): void {
+    this.history = this.history.filter((record) => record.candidateId !== candidateId);
   }
 
   public getStats(): AlertingEngineStats {
@@ -255,8 +263,8 @@ export class NotificationDispatcher {
   /**
    * Retries an alert dispatch for a historical record
    */
-  public async retryDispatch(recordId: string): Promise<AlertDispatchRecord | null> {
-    const existing = this.history.find((r) => r.id === recordId);
+  public async retryDispatch(recordId: string, candidateId?: string): Promise<AlertDispatchRecord | null> {
+    const existing = this.history.find((r) => r.id === recordId && (!candidateId || r.candidateId === candidateId));
     if (!existing) return null;
 
     return this.dispatchPayload(existing.payload, existing.candidateId, { bypassThreshold: true });

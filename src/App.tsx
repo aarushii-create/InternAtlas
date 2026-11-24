@@ -30,28 +30,13 @@ import {
   getActiveCandidateProfile,
   setActiveCandidateProfile,
 } from './lib/candidatePresets';
-import { computeCandidateMatches } from './lib/candidateScorer';
-
-const INITIAL_TENANTS: TenantContext[] = [
-  {
-    tenantId: 'tenant-alex-rivera',
-    tenantName: 'Alex Rivera (Stanford CS)',
-    userEmail: 'alex.rivera@stanford.edu',
-  },
-  {
-    tenantId: 'tenant-jordan-chen',
-    tenantName: 'Jordan Chen (UC Berkeley EECS)',
-    userEmail: 'jordan.chen@berkeley.edu',
-  },
-  {
-    tenantId: 'tenant-custom',
-    tenantName: 'Custom Candidate Workspace',
-    userEmail: 'user@internatlas.ai',
-  },
-];
 
 export default function App() {
-  const [currentTenant, setCurrentTenant] = useState<TenantContext>(INITIAL_TENANTS[0]);
+  const [currentTenant, setCurrentTenant] = useState<TenantContext>({
+    tenantId: 'tenant-custom',
+    tenantName: 'Workspace',
+    userEmail: '',
+  });
   const [stats, setStats] = useState<DatabaseStats | null>(null);
   const [activeTab, setActiveTab] = useState<MainNavTab>('overview');
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false);
@@ -62,7 +47,6 @@ export default function App() {
 
   // Dashboard Data State
   const [dashboardData, setDashboardData] = useState<DashboardOverviewPayload | null>(null);
-  const [rawMatches, setRawMatches] = useState<ProductionJobMatch[]>([]);
   const [loadingDashboard, setLoadingDashboard] = useState<boolean>(true);
 
   // Auth & Onboarding State
@@ -73,39 +57,43 @@ export default function App() {
   const [isOnboardingModalOpen, setIsOnboardingModalOpen] = useState<boolean>(false);
 
   useEffect(() => {
-    fetchStats();
     restoreSession();
-    fetchDashboardOverview();
   }, []);
 
-  // When active candidate changes, dynamically re-score and recalibrate the matches!
+  useEffect(() => {
+    if (authToken) {
+      fetchDashboardOverview(authToken);
+      fetchStats(authToken);
+    } else {
+      setDashboardData(null);
+      setLoadingDashboard(false);
+    }
+  }, [authToken]);
+
+  useEffect(() => {
+    if (!authToken) return;
+    const refreshSession = async () => {
+      const response = await safeFetchJson<{ token: string }>('/api/auth/me');
+      if (response.status === 401) {
+        handleLogout();
+      } else if (response.ok && response.data?.token) {
+        setAuthToken(response.data.token);
+      }
+    };
+    const interval = window.setInterval(() => void refreshSession(), 5 * 60 * 1000);
+    return () => window.clearInterval(interval);
+  }, [authToken]);
+
   const handleSelectCandidate = (newCandidate: CandidateProfile) => {
     setActiveCandidate(newCandidate);
     setActiveCandidateProfile(newCandidate.id);
-
-    if (rawMatches.length > 0) {
-      const rescored = computeCandidateMatches(newCandidate, rawMatches);
-      setDashboardData((prev) => {
-        if (!prev) return prev;
-        return {
-          ...prev,
-          topMatches: rescored,
-          resumeComponentsSummary: {
-            totalSubVectors: 768,
-            primaryTrack: newCandidate.primaryTrack,
-            skillsCount: newCandidate.skills.length,
-            experienceCount: newCandidate.experience?.length || 1,
-            deltaVersion: 'v2.4-calibrated',
-            lastUpdated: new Date().toISOString(),
-          },
-        };
-      });
-    }
   };
 
-  const fetchStats = async () => {
+  const fetchStats = async (token: string) => {
     try {
-      const res = await safeFetchJson<DatabaseStats>('/api/db/stats');
+      const res = await safeFetchJson<DatabaseStats>('/api/db/stats', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
       if (res.ok && res.data) {
         setStats(res.data);
       }
@@ -114,36 +102,25 @@ export default function App() {
     }
   };
 
-  const fetchDashboardOverview = async () => {
+  const fetchDashboardOverview = async (token: string | null = authToken) => {
+    if (!token) {
+      setDashboardData(null);
+      setLoadingDashboard(false);
+      return;
+    }
+
     try {
       setLoadingDashboard(true);
-      const res = await fetch('/api/dashboard/overview');
-      if (res.ok) {
-        const payload: DashboardOverviewPayload = await res.json();
-        setRawMatches(payload.topMatches || []);
-
-        // Calibrate matches for active candidate
-        const candidateProfile = getActiveCandidateProfile();
-        setActiveCandidate(candidateProfile);
-        const calibratedMatches = computeCandidateMatches(candidateProfile, payload.topMatches || []);
-
-        setDashboardData({
-          ...payload,
-          topMatches: calibratedMatches,
-          resumeComponentsSummary: {
-            totalSubVectors: 768,
-            primaryTrack: candidateProfile.primaryTrack,
-            skillsCount: candidateProfile.skills.length,
-            experienceCount: candidateProfile.experience?.length || 1,
-            deltaVersion: 'v2.4-calibrated',
-            lastUpdated: new Date().toISOString(),
-          },
-        });
-
-        if (payload.targetParameters) {
-          setUserPreferences(payload.targetParameters);
-        }
+      const res = await fetch('/api/dashboard/overview', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        if (res.status === 401) handleLogout();
+        throw new Error(`Dashboard request failed (${res.status})`);
       }
+      const payload: DashboardOverviewPayload = await res.json();
+      setDashboardData(payload);
+      setUserPreferences(payload.targetParameters);
     } catch (err) {
       console.error('Failed to load dashboard overview:', err);
     } finally {
@@ -158,89 +135,77 @@ export default function App() {
     try {
       const res = await fetch(`/api/dashboard/match-status/${jobId}`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
         body: JSON.stringify({ applicationStatus: newStatus }),
       });
-      if (res.ok) {
-        setDashboardData((prev) => {
-          if (!prev) return prev;
-          return {
-            ...prev,
-            topMatches: prev.topMatches.map((m) =>
-              m.jobId === jobId ? { ...m, applicationStatus: newStatus } : m
-            ),
-          };
-        });
+      if (!res.ok) {
+        if (res.status === 401) handleLogout();
+        throw new Error(`Application status update failed (${res.status})`);
       }
+      setDashboardData((prev) => prev ? {
+        ...prev,
+        topMatches: prev.topMatches.map((match) =>
+          match.jobId === jobId ? { ...match, applicationStatus: newStatus } : match
+        ),
+      } : prev);
     } catch (err) {
       console.error('Failed to update status:', err);
     }
   };
 
   const restoreSession = async () => {
-    const token = localStorage.getItem('scout_jwt_token');
-    if (!token) {
-      autoLoginSeedUser('alex.rivera@stanford.edu', 'password123');
-      return;
-    }
-
+    localStorage.removeItem('scout_jwt_token');
     try {
-      const res = await safeFetchJson<{ user: UserType; preferences: UserPreferences }>('/api/auth/me', {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await safeFetchJson<{ token: string; user: UserType; preferences: UserPreferences }>('/api/auth/me');
       if (res.ok && res.data) {
         const data = res.data;
-        setAuthToken(token);
-        setCurrentUser(data.user);
-        setUserPreferences(data.preferences);
-
-        const matchingTenant = INITIAL_TENANTS.find((t) => t.tenantId === data.user.tenantId);
-        if (matchingTenant) {
-          setCurrentTenant(matchingTenant);
-        }
-      } else {
-        localStorage.removeItem('scout_jwt_token');
-        autoLoginSeedUser('alex.rivera@stanford.edu', 'password123');
-      }
-    } catch {
-      // Quietly ignore transient errors
-    }
-  };
-
-  const autoLoginSeedUser = async (email: string, password: string) => {
-    try {
-      const res = await safeFetchJson<{ token: string; user: UserType }>('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password }),
-      });
-      if (res.ok && res.data) {
-        const data = res.data;
-        localStorage.setItem('scout_jwt_token', data.token);
         setAuthToken(data.token);
         setCurrentUser(data.user);
+        setUserPreferences(data.preferences);
+        setCurrentTenant({
+          tenantId: data.user.tenantId,
+          tenantName: `${data.user.fullName}'s Workspace`,
+          userEmail: data.user.email,
+        });
+      } else {
+        if (res.status === 401) {
+          setAuthToken(null);
+          setCurrentUser(null);
+          setIsAuthModalOpen(true);
+        } else {
+          console.error('Session restore failed:', res.error || `HTTP ${res.status}`);
+          setIsAuthModalOpen(true);
+        }
       }
-    } catch {
-      // Quietly ignore transient errors
+    } catch (error) {
+      console.error('Failed to restore the signed-in session:', error);
+      setIsAuthModalOpen(true);
     }
   };
 
   const handleAuthSuccess = (token: string, user: UserType) => {
     setAuthToken(token);
     setCurrentUser(user);
-    const matchingTenant = INITIAL_TENANTS.find((t) => t.tenantId === user.tenantId);
-    if (matchingTenant) {
-      setCurrentTenant(matchingTenant);
-    }
-    fetchStats();
-    fetchDashboardOverview();
+    setCurrentTenant({
+      tenantId: user.tenantId,
+      tenantName: `${user.fullName}'s Workspace`,
+      userEmail: user.email,
+    });
   };
 
   const handleLogout = () => {
     localStorage.removeItem('scout_jwt_token');
+    void fetch('/api/auth/logout', { method: 'POST' }).catch((error) => {
+      console.error('Failed to clear the server session cookie:', error);
+    });
     setAuthToken(null);
     setCurrentUser(null);
     setUserPreferences(undefined);
+    setDashboardData(null);
+    setIsAuthModalOpen(true);
   };
 
   return (
@@ -254,13 +219,13 @@ export default function App() {
         currentUser={currentUser}
         authToken={authToken}
         currentTenant={currentTenant}
-        availableTenants={INITIAL_TENANTS}
+        availableTenants={currentUser ? [currentTenant] : []}
         onSelectTenant={(t) => setCurrentTenant(t)}
         onOpenAuthModal={() => setIsAuthModalOpen(true)}
         onOpenOnboarding={() => setIsOnboardingModalOpen(true)}
         onLogout={handleLogout}
-        matchesCount={dashboardData?.topMatches?.length || 28}
-        unreadAlertsCount={3}
+        matchesCount={dashboardData?.topMatches.length ?? 0}
+        alertsSentTodayCount={dashboardData?.stats.alertsDispatchedToday ?? 0}
       />
 
       {/* 2. Main Content Area */}
@@ -276,7 +241,6 @@ export default function App() {
           stats={stats}
           currentUser={currentUser}
           onOpenOnboarding={() => setIsOnboardingModalOpen(true)}
-          activeCandidate={activeCandidate}
         />
 
         {/* Scrollable View Container */}
@@ -292,16 +256,16 @@ export default function App() {
                 onOpenPreferences={() => setActiveTab('preferences')}
                 onOpenResumeIntelligence={() => setActiveTab('resume')}
                 onRefreshData={fetchDashboardOverview}
-                activeCandidate={activeCandidate}
               />
             )}
 
             {activeTab === 'preferences' && (
               <TargetPreferencesView
                 initialPreferences={userPreferences}
+                authToken={authToken}
                 onSaved={() => {
-                  fetchDashboardOverview();
-                  fetchStats();
+                  fetchDashboardOverview(authToken);
+                  if (authToken) fetchStats(authToken);
                 }}
               />
             )}
@@ -312,6 +276,7 @@ export default function App() {
                 onSelectCandidate={handleSelectCandidate}
                 currentUser={currentUser}
                 authToken={authToken}
+                onResumeSaved={() => fetchDashboardOverview(authToken)}
               />
             )}
 
@@ -324,7 +289,7 @@ export default function App() {
             )}
 
             {activeTab === 'feedback' && (
-              <FeedbackLoopStudio />
+              <FeedbackLoopStudio candidateId={currentUser?.id ?? ''} />
             )}
 
             {activeTab === 'dev-sandbox' && (
@@ -337,7 +302,9 @@ export default function App() {
       {/* Auth Modal */}
       <AuthModal
         isOpen={isAuthModalOpen}
-        onClose={() => setIsAuthModalOpen(false)}
+        onClose={() => {
+          if (authToken) setIsAuthModalOpen(false);
+        }}
         onAuthSuccess={handleAuthSuccess}
       />
 
@@ -361,8 +328,8 @@ export default function App() {
               onOnboardingComplete={(pref) => {
                 setUserPreferences(pref);
                 setIsOnboardingModalOpen(false);
-                fetchDashboardOverview();
-                fetchStats();
+                fetchDashboardOverview(authToken);
+                if (authToken) fetchStats(authToken);
               }}
             />
           </div>

@@ -1,16 +1,15 @@
 /**
  * AI Internship Scout - Phase 10: Scraper Scheduler & Polling Engine
- * Manages automated cron-style polling every 10–30 minutes with staggered batching,
- * proxy rotation, rate-limit interception, and automatic pipeline ingestion.
+ * Manages opt-in polling through the same timeout, retry, and provider-throttled ATS adapters
+ * used by direct ingestion.
  */
 
-import { ScraperSchedule, ScraperTaskPayload, TaskResultSummary, QueueTask, Job } from '../../types';
+import { ScraperSchedule, ScraperTaskPayload, TaskResultSummary, QueueTask, ScraperBoardHealth } from '../../types';
 import { taskQueue } from './taskQueue';
-import { proxyRotator } from './proxyRotator';
 import { GreenhouseScraper } from '../scrapers/GreenhouseScraper';
 import { LeverScraper } from '../scrapers/LeverScraper';
 import { db } from '../../db/database';
-import { generateDeterministicEmbedding } from '../../db/database';
+import { TARGET_COMPANIES_CATALOG } from '../scrapers/targetCompaniesCatalog';
 
 const DEFAULT_SCHEDULES_SEED: Omit<ScraperSchedule, 'lastRunAt' | 'nextRunAt' | 'consecutiveFailures' | 'totalRuns' | 'successfulRuns'>[] = [
   {
@@ -140,12 +139,15 @@ export class ScraperSchedulerEngine {
   private greenhouseScraper = new GreenhouseScraper();
   private leverScraper = new LeverScraper();
   private schedulerTimerHandle?: NodeJS.Timeout;
-  private isRunning: boolean = true;
+  private isRunning: boolean =
+    process.env.ENABLE_LIVE_SCRAPING === 'true' &&
+    process.env.ATS_TERMS_REVIEWED === 'true' &&
+    process.env.ENABLE_SCRAPER_SCHEDULER === 'true';
 
   constructor() {
     this.initializeSchedules();
     this.registerWorkerHandlers();
-    this.startSchedulerLoop();
+    if (this.isRunning) this.startSchedulerLoop();
   }
 
   /**
@@ -160,6 +162,7 @@ export class ScraperSchedulerEngine {
 
       this.schedules.set(seed.id, {
         ...seed,
+        isEnabled: seed.isEnabled && this.isRunning,
         lastRunAt: undefined,
         nextRunAt: nextRun,
         consecutiveFailures: 0,
@@ -176,7 +179,9 @@ export class ScraperSchedulerEngine {
   private registerWorkerHandlers(): void {
     taskQueue.registerHandler('greenhouse_poll', (task, log) => this.executeGreenhouseTask(task, log));
     taskQueue.registerHandler('lever_poll', (task, log) => this.executeLeverTask(task, log));
-    taskQueue.registerHandler('custom_poll', (task, log) => this.executeGreenhouseTask(task, log));
+    taskQueue.registerHandler('custom_poll', async () => {
+      throw new Error('No custom REST scraper connector is implemented.');
+    });
     taskQueue.registerHandler('batch_poll', (task, log) => this.executeBatchPollTask(task, log));
   }
 
@@ -219,6 +224,7 @@ export class ScraperSchedulerEngine {
    * Triggers a specific schedule immediately
    */
   public triggerSchedule(scheduleId: string, isManual: boolean = true): QueueTask | null {
+    if (!this.isRunning) return null;
     const schedule = this.schedules.get(scheduleId);
     if (!schedule) return null;
 
@@ -240,7 +246,7 @@ export class ScraperSchedulerEngine {
       type: taskType,
       payload,
       priority: isManual ? 'high' : 'normal',
-      maxAttempts: 3,
+      maxAttempts: 1,
       backoffMs: 2000,
     });
 
@@ -248,7 +254,7 @@ export class ScraperSchedulerEngine {
   }
 
   /**
-   * Worker Execution: Greenhouse ATS Polling with Resilient Proxy Fetch & Ingestion
+   * Poll a configured Greenhouse board and persist its verified job snapshot.
    */
   private async executeGreenhouseTask(
     task: QueueTask,
@@ -257,41 +263,38 @@ export class ScraperSchedulerEngine {
     const startTime = Date.now();
     const { boardToken, companyName } = task.payload;
 
-    log('info', `Initiating Greenhouse poll for ${companyName} (${boardToken}) via resilient proxy mesh.`);
-    const targetUrl = `https://boards-api.greenhouse.io/v1/boards/${encodeURIComponent(boardToken)}/jobs?content=true`;
-
-    // Fetch with resilience (proxy rotation, jittered backoff, UA randomization)
-    const fetchResult = await proxyRotator.fetchWithResilience(targetUrl, {
-      timeoutMs: 8000,
-      maxRetries: 3,
-      baseBackoffMs: 800,
-    });
-
-    if (!fetchResult.success && fetchResult.statusCode === 429) {
-      log('warn', `Rate limited (429) on Greenhouse board ${boardToken}. Rotated proxy ${fetchResult.proxyUsed?.id}.`);
-    }
-
-    // Normalize jobs
-    let normalizedJobs: any[] = [];
-    if (fetchResult.data?.jobs && Array.isArray(fetchResult.data.jobs)) {
-      normalizedJobs = fetchResult.data.jobs.map((j: any) => this.greenhouseScraper.normalizeJob(j, companyName));
-      log('info', `Fetched ${normalizedJobs.length} live jobs from Greenhouse API.`);
-    } else {
-      // High-fidelity fallback feed if upstream sandbox blocks
-      log('info', `Greenhouse API returned ${fetchResult.statusCode}. Parsing fallback feed for ${companyName}.`);
+    log('info', `Initiating Greenhouse poll for ${companyName} (${boardToken}).`);
+    let normalizedJobs;
+    try {
       normalizedJobs = await this.greenhouseScraper.fetchBoard(boardToken, companyName);
+    } catch (error) {
+      this.recordBoardHealth('greenhouse', boardToken, companyName, 'failed', undefined, error);
+      throw error;
     }
+    const rejectedJobCount = normalizedJobs.filter((job) =>
+      !job.externalId || !job.jobTitle.trim() || !job.directApplyUrl
+    ).length;
+    this.recordBoardHealth(
+      'greenhouse',
+      boardToken,
+      companyName,
+      rejectedJobCount > 0 ? 'failed' : normalizedJobs.length > 0 ? 'healthy' : 'empty',
+      normalizedJobs.length,
+      rejectedJobCount > 0 ? new Error(`${rejectedJobCount} records lacked required job fields.`) : undefined
+    );
+    log('info', `Fetched ${normalizedJobs.length} postings from Greenhouse; ${rejectedJobCount} incomplete records.`);
 
     // Filter relevant software engineering & intern postings
     const internAndSweJobs = normalizedJobs.filter((job) => {
       const titleLower = job.jobTitle.toLowerCase();
       return (
+        Boolean(job.externalId && job.jobTitle.trim() && job.directApplyUrl) && (
         titleLower.includes('intern') ||
         titleLower.includes('software') ||
         titleLower.includes('engineer') ||
         titleLower.includes('developer') ||
         titleLower.includes('ml') ||
-        titleLower.includes('ai')
+        titleLower.includes('ai'))
       );
     });
 
@@ -299,53 +302,27 @@ export class ScraperSchedulerEngine {
     let deduplicatedCount = 0;
 
     for (const job of internAndSweJobs) {
-      const dedupHash = `hash-${job.company.toLowerCase().replace(/\s+/g, '')}-${job.jobTitle.toLowerCase().replace(/\s+/g, '')}-${job.location.toLowerCase()}`;
-      const existing = db.getJobByDedupHash(dedupHash);
-
-      if (existing) {
-        deduplicatedCount++;
-        // Update lastVerifiedActive
-        existing.lastVerifiedActive = new Date().toISOString();
-        existing.isActive = true;
-      } else {
-        // Insert new job
-        const newJob: Job = {
-          id: `job-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-          source: 'greenhouse',
-          externalId: job.externalId || `ext-${Date.now()}`,
-          dedupHash,
-          company: job.company,
-          title: job.jobTitle,
-          location: job.location,
-          isRemote: job.isRemote,
-          description: job.cleanDescription || job.jobTitle,
-          rawJd: job.rawDescription || job.cleanDescription || job.jobTitle,
-          statedRequirements: job.statedRequirements || {
-            requiredSkills: ['Python', 'TypeScript', 'Data Structures'],
-            preferredSkills: ['Distributed Systems', 'Cloud Services'],
-            education: "Bachelor's in Computer Science or related field",
-            experienceYears: 0,
-          },
-          informalBar: job.informalBar || {
-            dsaDifficulty: 'Medium',
-            oaPattern: 'LeetCode Medium, Arrays, HashMaps',
-            unstatedPreferences: ['Strong algorithms baseline'],
-            barDescription: 'Standard engineering assessment bar',
-          },
-          vectorEmbedding: generateDeterministicEmbedding(`${job.jobTitle} ${job.company} ${job.cleanDescription}`),
-          applyUrl: job.directApplyUrl || `https://boards.greenhouse.io/${boardToken}`,
-          postedAt: job.postedAt || new Date().toISOString(),
-          firstSeenAt: new Date().toISOString(),
-          lastVerifiedActive: new Date().toISOString(),
-          isActive: true,
-          relevanceStatus: 'RELEVANT',
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        };
-
-        db.insertJob(newJob);
-        insertedCount++;
-      }
+      const upserted = db.upsertJob({
+        source: 'greenhouse',
+        atsProvider: 'greenhouse',
+        dataOrigin: 'live',
+        externalId: job.externalId,
+        company: job.company,
+        title: job.jobTitle,
+        location: job.location,
+        isRemote: job.isRemote,
+        description: job.cleanDescription,
+        rawJd: job.rawDescription,
+        statedRequirements: job.statedRequirements,
+        informalBar: job.informalBar,
+        applyUrl: job.directApplyUrl,
+        postedAt: job.postedAt,
+      });
+      if (upserted.isNew) insertedCount++;
+      else deduplicatedCount++;
+    }
+    if (rejectedJobCount === 0) {
+      db.deactivateMissingBoardJobs(companyName, 'greenhouse', internAndSweJobs.map((job) => job.externalId));
     }
 
     log('info', `Ingestion complete for ${companyName}: ${insertedCount} inserted, ${deduplicatedCount} deduplicated.`);
@@ -356,9 +333,14 @@ export class ScraperSchedulerEngine {
       if (schedule) {
         schedule.lastRunAt = new Date().toISOString();
         schedule.totalRuns++;
-        schedule.successfulRuns++;
-        schedule.consecutiveFailures = 0;
-        schedule.lastRunStatus = 'success';
+        if (rejectedJobCount === 0) {
+          schedule.successfulRuns++;
+          schedule.consecutiveFailures = 0;
+          schedule.lastRunStatus = 'success';
+        } else {
+          schedule.consecutiveFailures++;
+          schedule.lastRunStatus = 'failure';
+        }
         schedule.lastRunDurationMs = Date.now() - startTime;
       }
     }
@@ -368,10 +350,10 @@ export class ScraperSchedulerEngine {
       jobsNormalized: internAndSweJobs.length,
       jobsInserted: insertedCount,
       jobsDeduplicated: deduplicatedCount,
-      jobsDropped: Math.max(0, normalizedJobs.length - internAndSweJobs.length),
+      jobsDropped: Math.max(rejectedJobCount, normalizedJobs.length - internAndSweJobs.length),
       durationMs: Date.now() - startTime,
-      proxyUsed: fetchResult.proxyUsed?.id || 'direct-egress',
-      httpStatusCode: fetchResult.statusCode,
+      proxyUsed: 'direct-egress',
+      httpStatusCode: 200,
     };
   }
 
@@ -386,72 +368,53 @@ export class ScraperSchedulerEngine {
     const { boardToken, companyName } = task.payload;
 
     log('info', `Initiating Lever poll for ${companyName} (${boardToken}).`);
-    const targetUrl = `https://api.lever.co/v0/postings/${encodeURIComponent(boardToken)}?mode=json`;
-
-    const fetchResult = await proxyRotator.fetchWithResilience(targetUrl, {
-      timeoutMs: 8000,
-      maxRetries: 3,
-      baseBackoffMs: 800,
-    });
-
-    let normalizedJobs: any[] = [];
-    if (Array.isArray(fetchResult.data)) {
-      normalizedJobs = fetchResult.data.map((j: any) => this.leverScraper.normalizeJob(j, companyName));
-      log('info', `Fetched ${normalizedJobs.length} postings from Lever API.`);
-    } else {
-      log('info', `Using fallback feed for Lever board ${boardToken}.`);
+    let normalizedJobs;
+    try {
       normalizedJobs = await this.leverScraper.fetchBoard(boardToken, companyName);
+    } catch (error) {
+      this.recordBoardHealth('lever', boardToken, companyName, 'failed', undefined, error);
+      throw error;
     }
+    const rejectedJobCount = normalizedJobs.filter((job) =>
+      !job.externalId || !job.jobTitle.trim() || !job.directApplyUrl
+    ).length;
+    this.recordBoardHealth(
+      'lever',
+      boardToken,
+      companyName,
+      rejectedJobCount > 0 ? 'failed' : normalizedJobs.length > 0 ? 'healthy' : 'empty',
+      normalizedJobs.length,
+      rejectedJobCount > 0 ? new Error(`${rejectedJobCount} records lacked required job fields.`) : undefined
+    );
+    log('info', `Fetched ${normalizedJobs.length} postings from Lever; ${rejectedJobCount} incomplete records.`);
 
     let insertedCount = 0;
     let deduplicatedCount = 0;
 
     for (const job of normalizedJobs) {
-      const dedupHash = `hash-${job.company.toLowerCase().replace(/\s+/g, '')}-${job.jobTitle.toLowerCase().replace(/\s+/g, '')}-${job.location.toLowerCase()}`;
-      const existing = db.getJobByDedupHash(dedupHash);
+      if (!job.externalId || !job.jobTitle.trim() || !job.directApplyUrl) continue;
+      const upserted = db.upsertJob({
+        source: 'lever',
+        atsProvider: 'lever',
+        dataOrigin: 'live',
+        externalId: job.externalId,
+        company: job.company,
+        title: job.jobTitle,
+        location: job.location,
+        isRemote: job.isRemote,
+        description: job.cleanDescription,
+        rawJd: job.rawDescription,
+        statedRequirements: job.statedRequirements,
+        informalBar: job.informalBar,
+        applyUrl: job.directApplyUrl,
+        postedAt: job.postedAt,
+      });
+      if (upserted.isNew) insertedCount++;
+      else deduplicatedCount++;
+    }
 
-      if (existing) {
-        deduplicatedCount++;
-        existing.lastVerifiedActive = new Date().toISOString();
-        existing.isActive = true;
-      } else {
-        const newJob: Job = {
-          id: `job-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-          source: 'lever',
-          externalId: job.externalId || `ext-${Date.now()}`,
-          dedupHash,
-          company: job.company,
-          title: job.jobTitle,
-          location: job.location,
-          isRemote: job.isRemote,
-          description: job.cleanDescription || job.jobTitle,
-          rawJd: job.rawDescription || job.cleanDescription || job.jobTitle,
-          statedRequirements: job.statedRequirements || {
-            requiredSkills: ['C++', 'Java', 'Python', 'Algorithms'],
-            preferredSkills: ['Cloud Infrastructure', 'Kubernetes'],
-            education: "Bachelor's or Master's in Computer Science",
-            experienceYears: 0,
-          },
-          informalBar: job.informalBar || {
-            dsaDifficulty: 'Hard',
-            oaPattern: 'HackerRank Hard, Graph, Trees, DP',
-            unstatedPreferences: ['High LeetCode proficiency'],
-            barDescription: 'Rigorous engineering screening',
-          },
-          vectorEmbedding: generateDeterministicEmbedding(`${job.jobTitle} ${job.company} ${job.cleanDescription}`),
-          applyUrl: job.directApplyUrl || `https://jobs.lever.co/${boardToken}`,
-          postedAt: job.postedAt || new Date().toISOString(),
-          firstSeenAt: new Date().toISOString(),
-          lastVerifiedActive: new Date().toISOString(),
-          isActive: true,
-          relevanceStatus: 'RELEVANT',
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        };
-
-        db.insertJob(newJob);
-        insertedCount++;
-      }
+    if (rejectedJobCount === 0) {
+      db.deactivateMissingBoardJobs(companyName, 'lever', normalizedJobs.map((job) => job.externalId));
     }
 
     // Update schedule stats if attached
@@ -460,9 +423,14 @@ export class ScraperSchedulerEngine {
       if (schedule) {
         schedule.lastRunAt = new Date().toISOString();
         schedule.totalRuns++;
-        schedule.successfulRuns++;
-        schedule.consecutiveFailures = 0;
-        schedule.lastRunStatus = 'success';
+        if (rejectedJobCount === 0) {
+          schedule.successfulRuns++;
+          schedule.consecutiveFailures = 0;
+          schedule.lastRunStatus = 'success';
+        } else {
+          schedule.consecutiveFailures++;
+          schedule.lastRunStatus = 'failure';
+        }
         schedule.lastRunDurationMs = Date.now() - startTime;
       }
     }
@@ -472,11 +440,46 @@ export class ScraperSchedulerEngine {
       jobsNormalized: normalizedJobs.length,
       jobsInserted: insertedCount,
       jobsDeduplicated: deduplicatedCount,
-      jobsDropped: 0,
+      jobsDropped: rejectedJobCount,
       durationMs: Date.now() - startTime,
-      proxyUsed: fetchResult.proxyUsed?.id || 'direct-egress',
-      httpStatusCode: fetchResult.statusCode,
+      proxyUsed: 'direct-egress',
+      httpStatusCode: 200,
     };
+  }
+
+  private recordBoardHealth(
+    provider: 'greenhouse' | 'lever',
+    boardToken: string,
+    companyName: string,
+    status: 'healthy' | 'empty' | 'failed',
+    fetchedCount?: number,
+    error?: unknown
+  ): void {
+    const company = TARGET_COMPANIES_CATALOG.find((entry) =>
+      entry.atsProvider === provider &&
+      (entry.name.toLowerCase() === companyName.toLowerCase() || entry.boardToken.toLowerCase() === boardToken.toLowerCase())
+    );
+    const previous = company
+      ? db.getScraperBoardHealth().find((entry) => entry.companyId === company.id)
+      : undefined;
+    const health: ScraperBoardHealth = {
+      companyId: company?.id ?? `${provider}-${boardToken}`,
+      company: companyName,
+      provider,
+      connectorStatus: 'supported',
+      verificationStatus: status,
+      lastAttemptAt: new Date().toISOString(),
+      ...(status === 'healthy' || status === 'empty'
+        ? { lastSuccessfulFetchAt: new Date().toISOString(), lastFetchedJobCount: fetchedCount }
+        : {
+            lastSuccessfulFetchAt: previous?.lastSuccessfulFetchAt,
+            lastFetchedJobCount: previous?.lastFetchedJobCount,
+          }),
+      ...(error
+        ? { lastError: error instanceof Error ? error.message : 'Unknown board fetch error.' }
+        : status === 'failed' ? { lastError: 'Board fetch failed.' } : {}),
+    };
+    db.upsertScraperBoardHealth(health);
   }
 
   /**

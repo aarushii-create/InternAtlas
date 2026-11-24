@@ -41,6 +41,7 @@ interface ResumeIntelligenceViewProps {
   onSelectCandidate?: (candidate: CandidateProfile) => void;
   currentUser?: UserType | null;
   authToken?: string | null;
+  onResumeSaved?: () => void;
 }
 
 export const ResumeIntelligenceView: React.FC<ResumeIntelligenceViewProps> = ({
@@ -48,6 +49,7 @@ export const ResumeIntelligenceView: React.FC<ResumeIntelligenceViewProps> = ({
   onSelectCandidate: propOnSelectCandidate,
   currentUser,
   authToken,
+  onResumeSaved,
 }) => {
   const [candidatesList, setCandidatesList] = useState<CandidateProfile[]>(getStoredCandidateProfiles());
   const [candidate, setCandidate] = useState<CandidateProfile>(
@@ -555,6 +557,7 @@ export const ResumeIntelligenceView: React.FC<ResumeIntelligenceViewProps> = ({
           onResumeSaved={() => {
             refreshCandidates();
             setActiveSubSection('profile');
+            onResumeSaved?.();
           }}
         />
       )}

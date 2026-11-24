@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS app_runtime_state (
+    id SMALLINT PRIMARY KEY CHECK (id = 1),
+    state JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

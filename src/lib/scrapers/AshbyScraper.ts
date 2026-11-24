@@ -11,6 +11,7 @@ import {
   extractStatedRequirements,
   extractInformalBarHints,
 } from '../normalizer';
+import { fetchAtsResponse, parseAtsJson, parsePostedAt } from './atsHttp';
 
 export interface RawAshbyJob {
   id: string;
@@ -42,28 +43,15 @@ export class AshbyScraper {
     const company = companyDisplayName || boardToken.charAt(0).toUpperCase() + boardToken.slice(1);
     const url = `${this.baseUrl}/${encodeURIComponent(boardToken)}?includeCompensation=true`;
 
-    try {
-      const response = await fetch(url, {
-        headers: {
-          Accept: 'application/json',
-          'User-Agent': 'AI-Internship-Scout/1.0',
-        },
-      });
-
-      if (!response.ok) {
-        return[];
-      }
-
-      const data: AshbyBoardResponse = await response.json();
-      if (!data.jobs || !Array.isArray(data.jobs)) {
-        return [];
-      }
-
-      return data.jobs.map((job) => this.normalizeJob(job, company));
-    } catch (err: any) {
-      console.warn(`Unable to refresh live job postings right now. Showing saved offline results.`);
-      return [];
-    }
+    const response = await fetchAtsResponse('ashby', url, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'InternAtlas/1.0 (job-board integration)',
+      },
+    });
+    const data = await parseAtsJson<AshbyBoardResponse>(response, 'ashby');
+    if (!Array.isArray(data.jobs)) throw new Error('Ashby returned an invalid job-board payload.');
+    return data.jobs.map((job) => this.normalizeJob(job, company));
   }
 
   /**
@@ -72,19 +60,19 @@ export class AshbyScraper {
   public normalizeJob(raw: RawAshbyJob, companyName: string): NormalizedAtsJob {
     const rawDescription = raw.descriptionHtml || raw.descriptionPlain || '';
     const cleanDescription = sanitizeHtml(rawDescription);
-    const location = raw.location || 'Bangalore / Hyderabad IND';
-    const jobTitle = raw.title || 'Software Engineering Intern 2027';
+    const location = raw.location || 'Location not specified';
+    const jobTitle = raw.title || '';
     const isRemote = raw.isRemote ?? detectRemote(jobTitle, location, cleanDescription);
     const externalId = String(raw.id);
-    const directApplyUrl = raw.jobUrl || `https://jobs.ashbyhq.com/${companyName.toLowerCase().replace(/\s+/g, '')}/${externalId}`;
+    const directApplyUrl = raw.jobUrl || '';
     const reqId = extractReqId(raw.id, directApplyUrl, rawDescription);
-    const postedAt = raw.publishedAt || new Date().toISOString();
+    const postedAt = parsePostedAt(raw.publishedAt);
 
     const statedRequirements = extractStatedRequirements(cleanDescription || jobTitle);
     const informalBar = extractInformalBarHints(companyName, jobTitle, cleanDescription);
 
     return {
-      source: 'ashby' as any,
+      source: 'ashby',
       externalId,
       reqId,
       company: companyName,

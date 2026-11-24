@@ -9,12 +9,31 @@ import {
 /**
  * In-Memory & Persistent Storage for User Feedback and Adaptive Threshold Profiles
  */
-class UserFeedbackStore {
+export class UserFeedbackStore {
   private feedbackRecords: UserFeedback[] = [];
   private userProfiles: Map<string, AdaptiveThresholdProfile> = new Map();
 
   constructor() {
-    this.seedDefaultProfile('alex-rivera-stanford', 'Alex Rivera');
+    if (process.env.NODE_ENV !== 'production') {
+      this.seedDefaultProfile('alex-rivera-stanford', 'Alex Rivera');
+    }
+  }
+
+  public exportState() {
+    return {
+      feedbackRecords: this.feedbackRecords,
+      userProfiles: [...this.userProfiles.entries()],
+    };
+  }
+
+  public importState(state: ReturnType<UserFeedbackStore['exportState']>): void {
+    const demoCandidateIds = new Set(['alex-rivera-stanford', 'jordan-chen-berkeley']);
+    this.feedbackRecords = state.feedbackRecords.filter((record) =>
+      process.env.NODE_ENV !== 'production' || !demoCandidateIds.has(record.candidateId)
+    );
+    this.userProfiles = new Map(state.userProfiles.filter(([candidateId]) =>
+      process.env.NODE_ENV !== 'production' || !demoCandidateIds.has(candidateId)
+    ));
   }
 
   public seedDefaultProfile(candidateId: string, candidateName: string): AdaptiveThresholdProfile {
@@ -77,6 +96,11 @@ class UserFeedbackStore {
 
   public updateProfile(profile: AdaptiveThresholdProfile): void {
     this.userProfiles.set(profile.candidateId, profile);
+  }
+
+  public deleteCandidate(candidateId: string): void {
+    this.userProfiles.delete(candidateId);
+    this.feedbackRecords = this.feedbackRecords.filter((record) => record.candidateId !== candidateId);
   }
 
   public addFeedback(feedback: UserFeedback): void {

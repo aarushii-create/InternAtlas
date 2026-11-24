@@ -1038,7 +1038,9 @@ export const JobDedupEngine: React.FC<JobDedupEngineProps> = ({
                     <tr key={job.id} className="hover:bg-slate-800/30 transition">
                       <td className="py-3 px-3">
                         <div className="font-semibold text-white">{job.company}</div>
-                        <div className="text-slate-400 text-[11px] truncate max-w-[200px]">{job.title}</div>
+                        <div className="text-slate-400 text-[11px] truncate max-w-[200px]">
+                          {job.title}{job.dataOrigin === 'demo' ? ' [DEMO]' : job.dataOrigin === 'manual' ? ' [MANUAL]' : ''}
+                        </div>
                       </td>
 
                       <td className="py-3 px-3">

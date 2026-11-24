@@ -17,31 +17,34 @@ import { UserPreferences } from '../../types';
 
 interface TargetPreferencesViewProps {
   initialPreferences?: UserPreferences;
+  authToken: string | null;
   onSaved?: () => void;
 }
 
 export const TargetPreferencesView: React.FC<TargetPreferencesViewProps> = ({
   initialPreferences,
+  authToken,
   onSaved,
 }) => {
   const [prefs, setPrefs] = useState<UserPreferences>({
-    id: 'pref-alex-rivera',
-    userId: 'user-alex-rivera-1',
-    tenantId: 'tenant-alex-rivera',
-    targetLocations: ['San Francisco, CA', 'New York, NY', 'Seattle, WA', 'Remote'],
-    targetRoles: ['Systems Engineer Intern', 'Quantitative Developer Intern', 'AI / ML Engineer Intern', 'Software Engineer Intern'],
-    preferredCompanies: ['Citadel Securities', 'Jane Street', 'OpenAI', 'Anthropic', 'Databricks', 'Two Sigma', 'Stripe'],
-    blacklistedCompanies: ['CryptoGambling Inc', 'SpamCorp'],
-    customMatchThreshold: 0.72,
-    alertMethod: 'telegram',
-    alertDestination: '@alex_rivera_scout_bot',
+    id: '',
+    userId: '',
+    tenantId: '',
+    targetLocations: [],
+    targetRoles: [],
+    preferredCompanies: [],
+    blacklistedCompanies: [],
+    customMatchThreshold: 0.7,
+    alertMethod: 'email',
+    alertDestination: '',
     isActive: true,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    createdAt: '',
+    updatedAt: '',
   });
 
   const [saving, setSaving] = useState(false);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // New item inputs
   const [newLocation, setNewLocation] = useState('');
@@ -55,19 +58,22 @@ export const TargetPreferencesView: React.FC<TargetPreferencesViewProps> = ({
     } else {
       fetchPreferences();
     }
-  }, [initialPreferences]);
+  }, [initialPreferences, authToken]);
 
   const fetchPreferences = async () => {
+    if (!authToken) return;
     try {
-      const res = await fetch('/api/dashboard/overview');
-      if (res.ok) {
-        const payload = await res.json();
-        if (payload.targetParameters) {
-          setPrefs(payload.targetParameters);
-        }
+      const res = await fetch('/api/dashboard/overview', {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      if (!res.ok) {
+        throw new Error(`Could not load preferences (${res.status})`);
       }
-    } catch {
-      // Keep defaults
+      const payload = await res.json();
+      if (payload.targetParameters) setPrefs(payload.targetParameters);
+    } catch (error) {
+      console.error('Failed to load target preferences:', error);
+      setErrorMsg('Could not load saved preferences. Please refresh and try again.');
     }
   };
 
@@ -75,18 +81,27 @@ export const TargetPreferencesView: React.FC<TargetPreferencesViewProps> = ({
     try {
       setSaving(true);
       setSuccessMsg(null);
+      setErrorMsg(null);
+      if (!authToken) throw new Error('Sign in before saving preferences.');
       const res = await fetch('/api/dashboard/target-parameters', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
         body: JSON.stringify(prefs),
       });
-      if (res.ok) {
-        setSuccessMsg('Target preferences and alerting threshold saved successfully!');
-        if (onSaved) onSaved();
-        setTimeout(() => setSuccessMsg(null), 4000);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.message || `Preference save failed (${res.status})`);
       }
+      const data = await res.json();
+      if (data.updatedParameters) setPrefs(data.updatedParameters);
+      setSuccessMsg('Target preferences and alerting threshold saved successfully!');
+      if (onSaved) onSaved();
+      setTimeout(() => setSuccessMsg(null), 4000);
     } catch (err) {
-      alert('Failed to save target preferences');
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to save target preferences.');
     } finally {
       setSaving(false);
     }
@@ -174,6 +189,11 @@ export const TargetPreferencesView: React.FC<TargetPreferencesViewProps> = ({
         <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs font-semibold text-emerald-300 flex items-center gap-2 animate-in fade-in">
           <CheckCircle2 className="w-4 h-4" />
           <span>{successMsg}</span>
+        </div>
+      )}
+      {errorMsg && (
+        <div role="alert" className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs font-semibold text-rose-300">
+          {errorMsg}
         </div>
       )}
 

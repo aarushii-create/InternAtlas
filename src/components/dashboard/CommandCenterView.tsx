@@ -150,7 +150,7 @@ export const CommandCenterView: React.FC<CommandCenterViewProps> = ({
     const highFit = data.topMatches.filter((m) => m.scores.finalScore >= 0.85).length;
     const avgFit = (data.topMatches.reduce((acc, m) => acc + m.scores.finalScore, 0) / total) * 100;
     const applied = data.topMatches.filter((m) => m.applicationStatus === 'APPLIED' || m.applicationStatus === 'INTERVIEWING' || m.applicationStatus === 'OFFER').length;
-    const dispatched = data.stats?.alertsDispatchedToday || highFit;
+    const dispatched = data.stats?.alertsDispatchedToday ?? 0;
 
     return { total, highFit, avgFit: avgFit.toFixed(1), applied, dispatched };
   }, [data]);
@@ -186,15 +186,14 @@ export const CommandCenterView: React.FC<CommandCenterViewProps> = ({
         <div className="flex flex-col">
           <div className="flex items-center gap-2">
             <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 rounded-md">
-              109 Target Companies
+              {data?.trackedCompanies.length ?? 0} Companies With Matches
             </span>
             <span className="text-[11px] text-slate-400 font-medium">
-              Real-time Greenhouse, Lever, Ashby, Workday & REST ATS Feed
+              Matches scored from saved resume and stored job records
             </span>
           </div>
           <h2 className="text-lg font-bold text-white tracking-tight mt-1 flex items-center gap-2">
-            <span>Live Candidate Ingestion Feed</span>
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+            <span>Personalized Internship Matches</span>
           </h2>
         </div>
 
@@ -272,7 +271,7 @@ export const CommandCenterView: React.FC<CommandCenterViewProps> = ({
             </div>
             <div className="flex items-center gap-1.5 text-[11px] text-emerald-400 font-medium mt-0.5">
               <TrendingUp className="w-3 h-3" />
-              <span>5 ATS Adapters Ingesting</span>
+              <span>From stored job records</span>
             </div>
           </div>
         </div>
@@ -290,7 +289,7 @@ export const CommandCenterView: React.FC<CommandCenterViewProps> = ({
               {loading ? <span className="animate-pulse">--</span> : stats.highFit}
             </div>
             <div className="text-[11px] text-slate-400 font-medium mt-0.5">
-              Above candidate {((data?.targetParameters.customMatchThreshold || 0.72) * 100).toFixed(0)}% threshold
+              Above candidate {((data?.targetParameters.customMatchThreshold ?? 0.7) * 100).toFixed(0)}% threshold
             </div>
           </div>
         </div>
@@ -415,13 +414,13 @@ export const CommandCenterView: React.FC<CommandCenterViewProps> = ({
           <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-800/80 text-[11px] text-slate-400">
             <span className="font-semibold text-slate-300">Active Criteria:</span>
             <span className="px-2 py-0.5 rounded-md bg-slate-950 border border-slate-800 text-slate-300">
-              Min Fit: {((data.targetParameters.customMatchThreshold || 0.72) * 100).toFixed(0)}%
+              Min Fit: {((data.targetParameters.customMatchThreshold ?? 0.7) * 100).toFixed(0)}%
             </span>
             <span className="px-2 py-0.5 rounded-md bg-slate-950 border border-slate-800 text-slate-300">
               Locations: {data.targetParameters.targetLocations?.slice(0, 3).join(', ')}
             </span>
             <span className="px-2 py-0.5 rounded-md bg-slate-950 border border-slate-800 text-slate-300">
-              Alerts: {data.targetParameters.alertDestination || '@alex_rivera_scout_bot'}
+              Alerts: {data.targetParameters.alertDestination || 'Not configured'}
             </span>
           </div>
         )}
@@ -451,9 +450,13 @@ export const CommandCenterView: React.FC<CommandCenterViewProps> = ({
           <div className="w-12 h-12 rounded-2xl bg-slate-800 flex items-center justify-center text-slate-400 mx-auto">
             <Search className="w-6 h-6" />
           </div>
-          <h3 className="text-base font-bold text-white">No Matching Internship Postings</h3>
+          <h3 className="text-base font-bold text-white">
+            {data?.resumeComponentsSummary ? 'No Matching Internship Postings' : 'No Saved Resume'}
+          </h3>
           <p className="text-xs text-slate-400 max-w-md mx-auto">
-            Try adjusting your search query, selecting "All Target Sectors", or lowering your fit threshold.
+            {data?.resumeComponentsSummary
+              ? 'Try adjusting your search query, selecting "All Target Sectors", or lowering your fit threshold.'
+              : 'Save a resume to calculate matches against the stored job catalog.'}
           </p>
           <button
             onClick={() => {
@@ -493,6 +496,15 @@ export const CommandCenterView: React.FC<CommandCenterViewProps> = ({
                         <span className="px-1.5 py-0.5 text-[9px] font-mono text-cyan-400 bg-cyan-950/60 border border-cyan-800/60 rounded">
                           {match.atsProvider}
                         </span>
+                        {match.dataOrigin && match.dataOrigin !== 'live' && (
+                          <span className={`px-1.5 py-0.5 text-[9px] font-bold rounded border ${
+                            match.dataOrigin === 'demo'
+                              ? 'text-amber-300 bg-amber-950/40 border-amber-800/60'
+                              : 'text-slate-300 bg-slate-800 border-slate-700'
+                          }`}>
+                            {match.dataOrigin === 'demo' ? 'DEMO POSTING' : 'MANUAL LISTING'}
+                          </span>
+                        )}
                         {getStatusBadge(match.applicationStatus)}
                       </div>
                       <h3 className="text-sm font-bold text-white tracking-tight truncate mt-0.5">

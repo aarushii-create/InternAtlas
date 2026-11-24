@@ -10,8 +10,8 @@
  *    - Projects Vector (w = 0.30)
  *    - Experience Vector (w = 0.25)
  *    - Education Vector (w = 0.10)
- * 2. Incremental Delta Vector Patching (recomputes ONLY affected sub-space in ~1-3ms vs 500-900ms full re-parse).
- * 3. Instant In-Memory & Database Re-Indexing for live background matching.
+ * 2. Incremental Delta Vector Patching (recomputes the affected sub-space).
+ * 3. In-memory & database re-indexing for live background matching.
  * 4. Comprehensive Audit Trail & Version Control.
  */
 
@@ -81,7 +81,7 @@ export class DynamicResumeEngine {
   ];
 
   private constructor() {
-    this.initializeSeedProfiles();
+    this.initializeMissingProfiles();
   }
 
   public static getInstance(): DynamicResumeEngine {
@@ -89,6 +89,13 @@ export class DynamicResumeEngine {
       DynamicResumeEngine.instance = new DynamicResumeEngine();
     }
     return DynamicResumeEngine.instance;
+  }
+
+  public deleteResumeData(resumeId: string): void {
+    this.modularProfiles.delete(resumeId);
+    this.resumeProjects.delete(resumeId);
+    this.resumeExperiences.delete(resumeId);
+    this.auditLogs.delete(resumeId);
   }
 
   /**
@@ -128,33 +135,22 @@ export class DynamicResumeEngine {
   }
 
   /**
-   * Seeds initial modular profiles for existing database resumes
+   * Builds modular profiles from saved resume data without adding sample content.
    */
-  public initializeSeedProfiles() {
+  public initializeMissingProfiles() {
     const resumes = db.getResumes();
     resumes.forEach((resume) => {
+      if (this.modularProfiles.has(resume.id)) return;
       const skillsText = resume.extractedSkills.join(', ');
       const skillsVec = resume.skillsVector || generateDeterministicEmbedding(skillsText);
 
-      // Extract initial projects
-      const initialProjects: ResumeProjectItem[] = [
-        {
-          id: `proj-${resume.id}-1`,
-          title: 'RAG-based Vector Database in Rust',
-          description: 'High-performance vector indexing with HNSW and SIMD cosine similarity routines.',
-          technologies: ['Rust', 'Vector Search', 'SIMD', 'Distributed Systems'],
-          metrics: 'Achieved 4,500 QPS with <2ms P99 latency on 1M embeddings.',
-          vector: generateDeterministicEmbedding('RAG Vector Database in Rust HNSW SIMD cosine similarity distributed systems'),
-        },
-        {
-          id: `proj-${resume.id}-2`,
-          title: 'Multi-Tenant Microservices Architecture',
-          description: 'Enterprise API gateway with JWT auth, rate limiting, and pgvector storage.',
-          technologies: ['TypeScript', 'Express', 'Docker', 'PostgreSQL', 'Redis'],
-          metrics: 'Handled 50M+ requests with zero downtime.',
-          vector: generateDeterministicEmbedding('Multi Tenant Microservices Node Express Docker PostgreSQL Redis API Gateway'),
-        },
-      ];
+      const initialProjects: ResumeProjectItem[] = (resume.parsedData?.projects || []).map((project, idx) => ({
+        id: `proj-${resume.id}-${idx}`,
+        title: project.title,
+        description: project.description,
+        technologies: project.technologies,
+        vector: generateDeterministicEmbedding(`${project.title} ${project.description} ${project.technologies.join(' ')}`),
+      }));
       this.resumeProjects.set(resume.id, initialProjects);
 
       // Projects sub-vector
@@ -167,14 +163,16 @@ export class DynamicResumeEngine {
         role: exp.role,
         duration: exp.duration,
         highlights: exp.highlights || [],
-        technologies: exp.technologies || ['C++', 'Python', 'Distributed Systems'],
+        technologies: exp.technologies || [],
         vector: generateDeterministicEmbedding(`${exp.company} ${exp.role} ${exp.highlights.join(' ')}`),
       }));
       this.resumeExperiences.set(resume.id, initialExp);
       const expVec = this.computeExperienceVector(initialExp);
 
       // Education sub-vector
-      const eduText = `${resume.content.slice(0, 150)} Stanford University B.S. Computer Science GPA 3.92`;
+      const eduText = (resume.parsedData?.education || [])
+        .map((education) => [education.degree, education.institution, education.graduationYear, education.gpa].filter(Boolean).join(' '))
+        .join('\n');
       const eduVec = generateDeterministicEmbedding(eduText);
 
       const compositeVec = this.synthesizeCompositeVector(skillsVec, projVec, expVec, eduVec);
@@ -197,24 +195,12 @@ export class DynamicResumeEngine {
         totalProjectsCount: initialProjects.length,
         totalExperienceCount: initialExp.length,
         lastPatchedAt: new Date().toISOString(),
-        lastDeltaType: 'ADD_SKILL',
-        lastDeltaDescription: 'Initial modular embedding baseline created',
+        lastDeltaType: 'INITIALIZE',
+        lastDeltaDescription: 'Initialized from saved resume data',
       };
 
       this.modularProfiles.set(resume.id, profile);
-      this.auditLogs.set(resume.id, [
-        {
-          id: `audit-${Date.now()}-init`,
-          timestamp: new Date().toISOString(),
-          version: 1,
-          deltaType: 'ADD_SKILL',
-          description: 'Initial modular baseline vector calibrated',
-          affectedSubVector: 'compositeVector',
-          processingLatencyMs: 2.1,
-          fullReprocessLatencyMs: 785.0,
-          speedupFactor: '373.8x',
-        },
-      ]);
+      this.auditLogs.set(resume.id, []);
     });
   }
 
@@ -223,7 +209,7 @@ export class DynamicResumeEngine {
    */
   private computeProjectsVector(projects: ResumeProjectItem[]): number[] {
     if (projects.length === 0) {
-      return generateDeterministicEmbedding('Software Projects Open Source');
+      return generateDeterministicEmbedding('');
     }
     const dim = 768;
     const aggregated: number[] = new Array(dim).fill(0);
@@ -243,7 +229,7 @@ export class DynamicResumeEngine {
    */
   private computeExperienceVector(experiences: ResumeExperienceItem[]): number[] {
     if (experiences.length === 0) {
-      return generateDeterministicEmbedding('Software Engineering Experience Work');
+      return generateDeterministicEmbedding('');
     }
     const dim = 768;
     const aggregated: number[] = new Array(dim).fill(0);
@@ -264,7 +250,7 @@ export class DynamicResumeEngine {
   public getModularProfile(resumeId: string): ModularProfileEmbeddings | undefined {
     let profile = this.modularProfiles.get(resumeId);
     if (!profile) {
-      this.initializeSeedProfiles();
+      this.initializeMissingProfiles();
       profile = this.modularProfiles.get(resumeId);
     }
     return profile;
@@ -321,7 +307,7 @@ export class DynamicResumeEngine {
 
     let profile = this.getModularProfile(resumeId);
     if (!profile) {
-      this.initializeSeedProfiles();
+      this.initializeMissingProfiles();
       profile = this.getModularProfile(resumeId)!;
     }
 
@@ -442,7 +428,7 @@ export class DynamicResumeEngine {
 
     let profile = this.getModularProfile(resumeId);
     if (!profile) {
-      this.initializeSeedProfiles();
+      this.initializeMissingProfiles();
       profile = this.getModularProfile(resumeId)!;
     }
 
@@ -563,7 +549,7 @@ export class DynamicResumeEngine {
 
     let profile = this.getModularProfile(resumeId);
     if (!profile) {
-      this.initializeSeedProfiles();
+      this.initializeMissingProfiles();
       profile = this.getModularProfile(resumeId)!;
     }
 
@@ -694,14 +680,16 @@ export class DynamicResumeEngine {
   }
 
   /**
-   * Reset resume profile back to baseline seed state
+   * Reset the resume profile to data from the saved resume.
    */
   public resetToBaseline(resumeId: string): ModularProfileEmbeddings {
     this.modularProfiles.delete(resumeId);
     this.resumeProjects.delete(resumeId);
     this.resumeExperiences.delete(resumeId);
     this.auditLogs.delete(resumeId);
-    this.initializeSeedProfiles();
+    const resume = db.getResumeById(resumeId);
+    if (!resume) throw new Error(`Resume not found: ${resumeId}`);
+    this.initializeMissingProfiles();
     return this.getModularProfile(resumeId)!;
   }
 }

@@ -105,8 +105,7 @@ const SAMPLE_JOB_ROLES: SampleJobRole[] = [
   },
 ];
 
-export const FeedbackLoopStudio: React.FC = () => {
-  const candidateId = 'alex-rivera-stanford';
+export const FeedbackLoopStudio: React.FC<{ candidateId: string }> = ({ candidateId }) => {
   const [profile, setProfile] = useState<AdaptiveThresholdProfile | null>(null);
   const [feedbackHistory, setFeedbackHistory] = useState<UserFeedback[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
@@ -122,6 +121,7 @@ export const FeedbackLoopStudio: React.FC = () => {
 
   // Fetch initial profile and history
   const loadProfileAndHistory = async () => {
+    if (!candidateId) return;
     setLoading(true);
     try {
       const pRes = await safeFetchJson<AdaptiveThresholdProfile>(`/api/feedback/profile/${candidateId}`);
@@ -138,7 +138,7 @@ export const FeedbackLoopStudio: React.FC = () => {
 
   useEffect(() => {
     loadProfileAndHistory();
-  }, []);
+  }, [candidateId]);
 
   // Submit action feedback
   const handleFeedbackAction = async (job: SampleJobRole, action: FeedbackActionType, source: 'web_ui' | 'telegram_inline' | 'email_link' = 'web_ui') => {

@@ -20,6 +20,7 @@ import {
   DatabaseStats,
   CompanyInsight,
   CompanyDataSource,
+  ScraperBoardHealth,
 } from '../types';
 import { cleanupEngine, CleanupOptions } from '../lib/cleanupEngine';
 import { layer1RagEngine } from '../lib/rag/layer1Engine';
@@ -89,7 +90,20 @@ export function generateDeterministicEmbedding(seedText: string): number[] {
   return vector.map((v) => parseFloat((v / norm).toFixed(6)));
 }
 
-class InAppDatabase {
+export interface InAppDatabaseState {
+  users: User[];
+  resumes: Resume[];
+  preferences: UserPreferences[];
+  jobs: Job[];
+  archivedJobs: ArchivedJob[];
+  matches: Match[];
+  notifications: NotificationLog[];
+  companyInsights: CompanyInsight[];
+  scraperBoardHealth?: ScraperBoardHealth[];
+  lastCleanupStats?: StorageBloatStats['lastCleanupRun'];
+}
+
+export class InAppDatabase {
   private users: User[] = [];
   private resumes: Resume[] = [];
   private preferences: UserPreferences[] = [];
@@ -98,15 +112,19 @@ class InAppDatabase {
   private matches: Match[] = [];
   private notifications: NotificationLog[] = [];
   private companyInsights: CompanyInsight[] = [];
-  private migrationStatus = '0000_initial_schema.sql, 0002_stale_jobs_cleanup.sql, 0003_company_insights_knowledge_graph.sql executed successfully';
-  private lastMigrationTime = new Date().toISOString();
+  private scraperBoardHealth: ScraperBoardHealth[] = [];
+  private migrationStatus = 'Database migrations have not been checked';
+  private lastMigrationTime = '';
   private lastCleanupStats?: StorageBloatStats['lastCleanupRun'];
 
-  constructor() {
-    this.seedDefaults();
+  constructor(seedDefaults = process.env.NODE_ENV !== 'production') {
+    if (seedDefaults) this.seedDefaults();
   }
 
-  public seedDefaults() {
+  public seedDefaults(): void {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('Demo seed data is disabled in production.');
+    }
     this.users = [];
     this.resumes = [];
     this.preferences = [];
@@ -115,6 +133,7 @@ class InAppDatabase {
     this.matches = [];
     this.notifications = [];
     this.companyInsights = [...MASTER_COMPANY_INSIGHTS];
+    this.scraperBoardHealth = [];
 
     // Tenant 1: Alex Rivera (Stanford CS)
     const user1Id = '11111111-1111-4111-a111-111111111111';
@@ -245,6 +264,7 @@ Experience: Quant Research Intern at Citadel Securities, Built High Frequency Or
     const job1: Job = {
       id: 'job-gs-001',
       source: 'greenhouse',
+      dataOrigin: 'demo',
       externalId: 'gs-gh-99823',
       dedupHash: 'gs-sw-ny-99823-hash-01',
       company: 'Goldman Sachs',
@@ -284,6 +304,7 @@ Experience: Quant Research Intern at Citadel Securities, Built High Frequency Or
     const job2: Job = {
       id: 'job-msft-002',
       source: 'lever',
+      dataOrigin: 'demo',
       externalId: 'msft-lv-44102',
       dedupHash: 'msft-swe-rd-44102-hash-02',
       company: 'Microsoft',
@@ -322,6 +343,7 @@ Experience: Quant Research Intern at Citadel Securities, Built High Frequency Or
     const job3: Job = {
       id: 'job-stripe-003',
       source: 'greenhouse',
+      dataOrigin: 'demo',
       externalId: 'stripe-gh-8812',
       dedupHash: 'stripe-swe-sf-8812-hash-03',
       company: 'Stripe',
@@ -360,6 +382,7 @@ Experience: Quant Research Intern at Citadel Securities, Built High Frequency Or
     const job4: Job = {
       id: 'job-dbx-004',
       source: 'direct',
+      dataOrigin: 'demo',
       externalId: 'dbx-dir-1120',
       dedupHash: 'dbx-swe-sf-1120-hash-04',
       company: 'Databricks',
@@ -525,6 +548,13 @@ Experience: Quant Research Intern at Citadel Securities, Built High Frequency Or
   }
 
   public verifyCredentials(email: string, password: string): User | null {
+    const normalizedEmail = email.toLowerCase();
+    if (
+      process.env.NODE_ENV === 'production' &&
+      ['alex.rivera@stanford.edu', 'jordan.chen@berkeley.edu'].includes(normalizedEmail)
+    ) {
+      return null;
+    }
     const user = this.getUserByEmail(email);
     if (!user || !user.passwordHash) return null;
 
@@ -573,6 +603,18 @@ Experience: Quant Research Intern at Citadel Securities, Built High Frequency Or
 
   public getResumeById(id: string, tenantId?: string): Resume | undefined {
     return this.resumes.find((r) => r.id === id && (!tenantId || r.tenantId === tenantId));
+  }
+
+  public deleteResume(id: string, tenantId: string, userId: string): boolean {
+    const index = this.resumes.findIndex(
+      (resume) => resume.id === id && resume.tenantId === tenantId && resume.userId === userId
+    );
+    if (index < 0) return false;
+    this.resumes.splice(index, 1);
+    this.matches = this.matches.filter(
+      (match) => match.userId !== userId || match.tenantId !== tenantId || match.resumeId !== id
+    );
+    return true;
   }
 
   public createResume(
@@ -649,7 +691,60 @@ Experience: Quant Research Intern at Citadel Securities, Built High Frequency Or
 
   // Jobs
   public getJobs(): Job[] {
+    this.deactivateJobsNotVerifiedBefore(
+      new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString()
+    );
     return this.jobs;
+  }
+
+  public getScraperBoardHealth(): ScraperBoardHealth[] {
+    return this.scraperBoardHealth;
+  }
+
+  public upsertScraperBoardHealth(health: ScraperBoardHealth): void {
+    const index = this.scraperBoardHealth.findIndex((entry) => entry.companyId === health.companyId);
+    if (index >= 0) this.scraperBoardHealth[index] = health;
+    else this.scraperBoardHealth.push(health);
+  }
+
+  public deactivateJobsNotVerifiedBefore(cutoff: string): number {
+    const cutoffTime = new Date(cutoff).getTime();
+    if (!Number.isFinite(cutoffTime)) throw new Error('Invalid job verification cutoff.');
+    const now = new Date().toISOString();
+    let deactivated = 0;
+    for (const job of this.jobs) {
+      const verifiedAt = new Date(job.lastVerifiedActive).getTime();
+      if (
+        job.isActive &&
+        job.dataOrigin !== 'demo' &&
+        job.dataOrigin !== 'manual' &&
+        (!Number.isFinite(verifiedAt) || verifiedAt < cutoffTime)
+      ) {
+        job.isActive = false;
+        job.updatedAt = now;
+        deactivated++;
+      }
+    }
+    return deactivated;
+  }
+
+  public deactivateMissingBoardJobs(company: string, source: Job['source'], activeExternalIds: string[]): number {
+    const activeIds = new Set(activeExternalIds);
+    const now = new Date().toISOString();
+    let deactivated = 0;
+    for (const job of this.jobs) {
+      if (
+        job.isActive &&
+        job.company.toLowerCase() === company.toLowerCase() &&
+        job.source === source &&
+        !activeIds.has(job.externalId)
+      ) {
+        job.isActive = false;
+        job.updatedAt = now;
+        deactivated++;
+      }
+    }
+    return deactivated;
   }
 
   public getJobById(id: string): Job | undefined {
@@ -707,6 +802,8 @@ Experience: Quant Research Intern at Citadel Securities, Built High Frequency Or
     if (existing) {
       existing.lastVerifiedActive = nowIso;
       existing.updatedAt = nowIso;
+      if (jobData.dataOrigin) existing.dataOrigin = jobData.dataOrigin;
+      if (jobData.atsProvider) existing.atsProvider = jobData.atsProvider;
       if (jobData.isActive !== undefined) existing.isActive = jobData.isActive;
       if (jobData.title) existing.title = jobData.title;
       if (jobData.location) existing.location = jobData.location;
@@ -996,6 +1093,64 @@ Experience: Quant Research Intern at Citadel Securities, Built High Frequency Or
     return newMatch;
   }
 
+  public replaceUserMatches(
+    userId: string,
+    tenantId: string,
+    matchData: Array<Omit<Match, 'id' | 'createdAt' | 'updatedAt'>>
+  ): Match[] {
+    const existingMatches = this.matches.filter(
+      (match) => match.userId === userId && match.tenantId === tenantId
+    );
+    const existingByJobId = new Map(existingMatches.map((match) => [match.jobId, match]));
+    const now = new Date().toISOString();
+    const updatedMatches = matchData.map((match) => {
+      const existing = existingByJobId.get(match.jobId);
+      return {
+        ...match,
+        id: existing?.id ?? uuidv4(),
+        applicationStatus: existing?.applicationStatus,
+        status:
+          existing && ['applied', 'skipped'].includes(existing.status)
+            ? existing.status
+            : match.status,
+        userFeedback: existing?.userFeedback,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      };
+    });
+
+    this.matches = [
+      ...this.matches.filter((match) => match.userId !== userId || match.tenantId !== tenantId),
+      ...updatedMatches,
+    ];
+    return updatedMatches;
+  }
+
+  public updateMatchApplicationStatus(
+    userId: string,
+    tenantId: string,
+    jobId: string,
+    applicationStatus: NonNullable<Match['applicationStatus']>
+  ): Match | undefined {
+    const match = this.matches.find(
+      (entry) => entry.userId === userId && entry.tenantId === tenantId && entry.jobId === jobId
+    );
+    if (!match) return undefined;
+
+    match.applicationStatus = applicationStatus;
+    match.status =
+      applicationStatus === 'APPLIED' ||
+      applicationStatus === 'OA_RECEIVED' ||
+      applicationStatus === 'INTERVIEWING' ||
+      applicationStatus === 'OFFER'
+        ? 'applied'
+        : applicationStatus === 'REJECTED'
+          ? 'skipped'
+          : 'pending';
+    match.updatedAt = new Date().toISOString();
+    return match;
+  }
+
   // Calculate 2-Layer Match score for a resume against a job
   public evaluateTwoLayerMatch(resume: Resume, job: Job, prefs?: UserPreferences) {
     // 1. Layer 1: Stated Requirements Fit (Dense Vector + Hybrid Lexical Keyword & Synonym Match)
@@ -1178,7 +1333,7 @@ Experience: Quant Research Intern at Citadel Securities, Built High Frequency Or
       jobsCount: this.jobs.length,
       matchesCount: this.matches.length,
       notificationsCount: this.notifications.length,
-      dbEngine: 'PostgreSQL + pgvector (Drizzle ORM Simulation Engine)',
+      dbEngine: 'PostgreSQL + pgvector (persistent runtime state)',
       vectorExtensionEnabled: true,
       vectorDimensions: 768,
       tenantsCount: tenants.size,
@@ -1187,10 +1342,50 @@ Experience: Quant Research Intern at Citadel Securities, Built High Frequency Or
     };
   }
 
-  public runMigrationSim(): string {
-    this.migrationStatus = '0000_initial_schema.sql & 0001_seed_data.sql executed successfully';
-    this.lastMigrationTime = new Date().toISOString();
-    return this.migrationStatus;
+  public exportState(): InAppDatabaseState {
+    return {
+      users: this.users,
+      resumes: this.resumes,
+      preferences: this.preferences,
+      jobs: this.jobs,
+      archivedJobs: this.archivedJobs,
+      matches: this.matches,
+      notifications: this.notifications,
+      companyInsights: this.companyInsights,
+      scraperBoardHealth: this.scraperBoardHealth,
+      lastCleanupStats: this.lastCleanupStats,
+    };
+  }
+
+  public importState(state: ReturnType<InAppDatabase['exportState']>): void {
+    const demoUserIds = new Set(
+      process.env.NODE_ENV === 'production'
+        ? state.users
+          .filter((user) => ['alex.rivera@stanford.edu', 'jordan.chen@berkeley.edu'].includes(user.email.toLowerCase()))
+          .map((user) => user.id)
+        : []
+    );
+    this.users = state.users.filter((user) => !demoUserIds.has(user.id));
+    this.resumes = state.resumes.filter((resume) => !demoUserIds.has(resume.userId));
+    this.preferences = state.preferences.filter((preference) => !demoUserIds.has(preference.userId));
+    this.jobs = state.jobs.map((job) => {
+      if (/^comp-[a-z0-9-]+-\d+-\d+$/.test(job.externalId)) {
+        job.dataOrigin = 'demo';
+        job.isActive = false;
+      }
+      return job;
+    });
+    this.archivedJobs = state.archivedJobs;
+    this.matches = state.matches.filter((match) => !demoUserIds.has(match.userId));
+    this.notifications = state.notifications.filter((notification) => !demoUserIds.has(notification.userId));
+    this.companyInsights = state.companyInsights ?? [...MASTER_COMPANY_INSIGHTS];
+    this.scraperBoardHealth = state.scraperBoardHealth ?? [];
+    this.lastCleanupStats = state.lastCleanupStats;
+  }
+
+  public setMigrationInfo(status: string, lastMigrationTime: string): void {
+    this.migrationStatus = status;
+    this.lastMigrationTime = lastMigrationTime;
   }
 }
 

@@ -605,7 +605,7 @@ export const CompositeScoringStudio: React.FC<CompositeScoringStudioProps> = ({
               >
                 {allJobs.map((job) => (
                   <option key={job.id} value={job.id}>
-                    {job.company} — {job.title} ({job.location}{job.isRemote ? ' • Remote' : ''})
+                    {job.company} — {job.title} ({job.location}{job.isRemote ? ' • Remote' : ''}){job.dataOrigin === 'demo' ? ' [DEMO]' : job.dataOrigin === 'manual' ? ' [MANUAL]' : ''}
                   </option>
                 ))}
               </select>
@@ -675,12 +675,12 @@ export const CompositeScoringStudio: React.FC<CompositeScoringStudioProps> = ({
                   Active Candidate Profile
                 </div>
                 <div className="text-base font-bold text-white mt-1 truncate">
-                  {currentResume?.title || 'Sam Taylor (Stanford CS)'}
+                  {currentResume?.title || 'No resume selected'}
                 </div>
                 <div className="text-xs text-slate-400 mt-2 space-y-1">
-                  <div><span className="text-slate-500">Skills:</span> {currentResume?.extractedSkills?.slice(0, 5).join(', ')}</div>
-                  <div><span className="text-slate-500">GPA:</span> {currentResume?.parsedData?.education?.[0]?.gpa || '3.94'}</div>
-                  <div><span className="text-slate-500">Target Locs:</span> {currentPreferences?.targetLocations?.slice(0, 2).join(', ') || 'SF, Bay Area, NYC'}</div>
+                  <div><span className="text-slate-500">Skills:</span> {currentResume?.extractedSkills?.slice(0, 5).join(', ') || 'Not extracted'}</div>
+                  <div><span className="text-slate-500">GPA:</span> {currentResume?.parsedData?.education?.find((education) => education.gpa)?.gpa || 'Not stated'}</div>
+                  <div><span className="text-slate-500">Target Locs:</span> {currentPreferences?.targetLocations?.slice(0, 2).join(', ') || 'Not configured'}</div>
                 </div>
               </div>
 

@@ -1,8 +1,7 @@
 /**
  * InternAtlas - Master Live Web Scraping Engine
- * Dynamically orchestrates real-time fetching across Greenhouse, Lever, Ashby, Workday,
- * SmartRecruiters, and Custom REST ATS endpoints for the full 100+ target company catalog.
- * Executes SHA-256 deterministic deduplication and Layer 1 + Layer 2 RAG scoring.
+ * Orchestrates live fetching through the Greenhouse, Lever, Ashby, and Workday adapters.
+ * Other catalog providers are reported as unsupported until an actual connector is implemented.
  */
 
 import { GreenhouseScraper } from './GreenhouseScraper';
@@ -21,18 +20,24 @@ import { db } from '../../db/database';
 import { layer1RagEngine } from '../rag/layer1Engine';
 import { layer2RagEngine } from '../rag/layer2Engine';
 import { compositeScoringEngine } from '../scoring/compositeScoringEngine';
-import { ProductionJobMatch, Resume, Job } from '../../types';
+import { ProductionJobMatch, Resume, Job, ScraperBoardHealth } from '../../types';
+import { SupportedAtsProvider } from './atsHttp';
+
+export type LiveScrapeStatus = 'SUCCESS' | 'EMPTY' | 'PARTIAL' | 'FAILED' | 'UNSUPPORTED';
 
 export interface LiveScrapeResult {
   company: string;
   category: CompanyCategory;
   provider: AtsProviderType;
   totalFetched: number;
+  rejectedJobCount: number;
   newUniqueJobs: number;
   duplicateCount: number;
   jobs: NormalizedAtsJob[];
   durationMs: number;
-  status: 'SUCCESS' | 'PARTIAL' | 'FALLBACK_TRIGGERED';
+  status: LiveScrapeStatus;
+  error?: string;
+  completeSnapshot: boolean;
 }
 
 export class LiveScraperEngine {
@@ -52,7 +57,46 @@ export class LiveScraperEngine {
    * Returns metadata for all target companies across the 5 categories
    */
   public getCatalog(): TargetCompanyMetadata[] {
-    return TARGET_COMPANIES_CATALOG;
+    return TARGET_COMPANIES_CATALOG.map((company) => ({
+      ...company,
+      isRealtimeEnabled: this.isBoardVerified(company.id),
+    }));
+  }
+
+  public isBoardVerified(companyId: string): boolean {
+    const health = db.getScraperBoardHealth().find((board) => board.companyId === companyId);
+    return health?.verificationStatus === 'healthy' || health?.verificationStatus === 'empty';
+  }
+
+  public getBoardHealth(): ScraperBoardHealth[] {
+    const savedById = new Map(db.getScraperBoardHealth().map((board) => [board.companyId, board]));
+    return TARGET_COMPANIES_CATALOG.map((company) => savedById.get(company.id) ?? {
+      companyId: company.id,
+      company: company.name,
+      provider: company.atsProvider,
+      connectorStatus: this.hasConfiguredConnector(company) ? 'supported' : 'unsupported',
+      verificationStatus: this.hasConfiguredConnector(company) ? 'not_checked' : 'unsupported',
+    });
+  }
+
+  private isSupported(provider: string): provider is SupportedAtsProvider {
+    return provider === 'greenhouse' || provider === 'lever' || provider === 'ashby' || provider === 'workday';
+  }
+
+  public hasConfiguredConnector(company: TargetCompanyMetadata): boolean {
+    if (!this.isSupported(company.atsProvider) || !company.boardToken.trim()) return false;
+    if (company.atsProvider !== 'workday') return true;
+    try {
+      const careers = new URL(company.careersUrl);
+      return careers.hostname.endsWith('.myworkdayjobs.com') &&
+        careers.pathname.split('/').filter(Boolean).length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  private isCompleteSnapshot(provider: SupportedAtsProvider): boolean {
+    return provider === 'greenhouse' || provider === 'lever' || provider === 'ashby';
   }
 
   /**
@@ -71,7 +115,10 @@ export class LiveScraperEngine {
         );
       }
       return true;
-    });
+    }).map((company) => ({
+      ...company,
+      isRealtimeEnabled: this.isBoardVerified(company.id),
+    }));
   }
 
   /**
@@ -79,39 +126,65 @@ export class LiveScraperEngine {
    */
   public async scrapeCompany(companyMeta: TargetCompanyMetadata): Promise<LiveScrapeResult> {
     const startTime = Date.now();
+    const attemptedAt = new Date().toISOString();
+    const supported = this.hasConfiguredConnector(companyMeta);
+    let upstreamJobCount = 0;
+    let rejectedJobCount = 0;
     let jobs: NormalizedAtsJob[] = [];
-    let status: LiveScrapeResult['status'] = 'SUCCESS';
+    let status: LiveScrapeStatus = supported ? 'SUCCESS' : 'UNSUPPORTED';
+    let error: string | undefined = supported
+      ? undefined
+      : `No configured live connector is available for ${companyMeta.atsProvider}.`;
 
-    try {
-      switch (companyMeta.atsProvider) {
-        case 'greenhouse':
-          jobs = await this.greenhouse.fetchBoard(companyMeta.boardToken, companyMeta.name);
-          break;
-        case 'lever':
-          jobs = await this.lever.fetchBoard(companyMeta.boardToken, companyMeta.name);
-          break;
-        case 'ashby':
-          jobs = await this.ashby.fetchBoard(companyMeta.boardToken, companyMeta.name);
-          break;
-        case 'workday':
-          jobs = await this.workday.fetchBoard(companyMeta.boardToken, companyMeta.name);
-          break;
-        case 'smartrecruiters':
-        case 'custom_rest':
-        default:
-          jobs = await this.fetchCustomRestEndpoint(companyMeta);
-          break;
+    if (supported) {
+      try {
+        switch (companyMeta.atsProvider) {
+          case 'greenhouse':
+            jobs = await this.greenhouse.fetchBoard(companyMeta.boardToken, companyMeta.name);
+            break;
+          case 'lever':
+            jobs = await this.lever.fetchBoard(companyMeta.boardToken, companyMeta.name);
+            break;
+          case 'ashby':
+            jobs = await this.ashby.fetchBoard(companyMeta.boardToken, companyMeta.name);
+            break;
+          case 'workday':
+            jobs = await this.workday.fetchBoard(companyMeta.boardToken, companyMeta.name, companyMeta.careersUrl);
+            break;
+        }
+        upstreamJobCount = jobs.length;
+        jobs = jobs.filter((job) => Boolean(job.externalId && job.jobTitle.trim() && job.directApplyUrl));
+        rejectedJobCount = upstreamJobCount - jobs.length;
+        status = rejectedJobCount > 0
+          ? (jobs.length > 0 ? 'PARTIAL' : 'FAILED')
+          : jobs.length > 0 ? 'SUCCESS' : 'EMPTY';
+        if (rejectedJobCount > 0) {
+          error = `${rejectedJobCount} upstream job record(s) lacked a title, stable ID, or direct application URL and were excluded.`;
+        }
+      } catch (scrapeError) {
+        status = 'FAILED';
+        error = scrapeError instanceof Error ? scrapeError.message : 'Unknown board fetch error.';
+        jobs = [];
       }
-    } catch (err) {
-      console.warn(`Error during live scrape for ${companyMeta.name}:`, err);
-      status = 'FALLBACK_TRIGGERED';
-      jobs = this.generateSyntheticLiveFeed(companyMeta);
     }
-
-    if (!jobs || jobs.length === 0) {
-      jobs = this.generateSyntheticLiveFeed(companyMeta);
-      status = 'FALLBACK_TRIGGERED';
-    }
+    const previousHealth = db.getScraperBoardHealth().find((board) => board.companyId === companyMeta.id);
+    const didFetchSucceed = status === 'SUCCESS' || status === 'EMPTY' || status === 'PARTIAL';
+    const health: ScraperBoardHealth = {
+      companyId: companyMeta.id,
+      company: companyMeta.name,
+      provider: companyMeta.atsProvider,
+      connectorStatus: supported ? 'supported' : 'unsupported',
+      verificationStatus: status === 'SUCCESS' ? 'healthy' : status === 'EMPTY' ? 'empty' : status === 'PARTIAL' || status === 'FAILED' ? 'failed' : 'unsupported',
+      ...(supported ? { lastAttemptAt: attemptedAt } : {}),
+      ...(didFetchSucceed
+        ? { lastSuccessfulFetchAt: new Date().toISOString(), lastFetchedJobCount: jobs.length }
+        : {
+            lastSuccessfulFetchAt: previousHealth?.lastSuccessfulFetchAt,
+            lastFetchedJobCount: previousHealth?.lastFetchedJobCount,
+          }),
+      ...(error ? { lastError: error } : { lastError: undefined }),
+    };
+    db.upsertScraperBoardHealth(health);
 
     // Run through deterministic deduplication processing
     let newUniqueJobs = 0;
@@ -148,71 +221,18 @@ export class LiveScraperEngine {
       company: companyMeta.name,
       category: companyMeta.category,
       provider: companyMeta.atsProvider,
-      totalFetched: jobs.length,
+      totalFetched: upstreamJobCount,
+      rejectedJobCount,
       newUniqueJobs,
       duplicateCount,
       jobs: uniqueNormalizedJobs.length > 0 ? uniqueNormalizedJobs : jobs,
       durationMs,
       status,
+      ...(error ? { error } : {}),
+      completeSnapshot: this.isSupported(companyMeta.atsProvider) &&
+        supported &&
+        this.isCompleteSnapshot(companyMeta.atsProvider),
     };
-  }
-
-  /**
-   * Custom REST / GraphQL endpoint connector
-   */
-  private async fetchCustomRestEndpoint(companyMeta: TargetCompanyMetadata): Promise<NormalizedAtsJob[]> {
-    return this.generateSyntheticLiveFeed(companyMeta);
-  }
-
-  /**
-   * Generates high-fidelity live normalized jobs based on official company engineering profile
-   */
-  public generateSyntheticLiveFeed(meta: TargetCompanyMetadata): NormalizedAtsJob[] {
-    const roles = meta.sampleRoles || ['Software Engineering Intern 2026'];
-    const loc = meta.primaryLocations[0] || 'San Francisco, CA / Remote';
-    const isRemote = loc.toLowerCase().includes('remote');
-
-    return roles.map((roleTitle, idx) => {
-      const externalId = `${meta.id}-${idx + 1}-${Date.now() % 100000}`;
-      const desc = `<h3>${meta.name} - ${roleTitle}</h3>
-<p>${meta.name} is seeking ambitious undergraduate and master's students for our Summer 2026 engineering internship program in ${loc}.</p>
-<h4>Technical Focus & Expectations</h4>
-<ul>
-  <li>Core Technologies: ${meta.dsaFocus.join(', ')}</li>
-  <li>Compensation Package: ${meta.compensationRange}</li>
-  <li>Hiring Rigor: ${meta.typicalHiringBar} tier evaluation with proctored technical coding assessments.</li>
-</ul>
-<p>You will work alongside staff engineers deploying mission-critical systems and data services.</p>`;
-
-      return {
-        source: meta.atsProvider as any,
-        externalId,
-        reqId: `REQ-${meta.boardToken.toUpperCase()}-2026-0${idx + 1}`,
-        company: meta.name,
-        jobTitle: roleTitle,
-        location: loc,
-        isRemote,
-        rawDescription: desc,
-        cleanDescription: `${meta.name} - ${roleTitle}. Focus: ${meta.dsaFocus.join(', ')}. Compensation: ${meta.compensationRange}. Locations: ${meta.primaryLocations.join(', ')}.`,
-        directApplyUrl: meta.careersUrl,
-        postedAt: new Date(Date.now() - (idx + 1) * 3600000 * 8).toISOString(),
-        statedRequirements: {
-          requiredSkills: meta.dsaFocus.slice(0, 4),
-          preferredSkills: meta.dsaFocus.slice(4),
-          education: 'Pursuing BS/MS/PhD in Computer Science or related STEM field',
-          experienceYears: 0,
-        },
-        informalBar: {
-          dsaDifficulty: meta.typicalHiringBar === 'Extreme' ? 'Hard' : (meta.typicalHiringBar as any),
-          oaPattern: `${meta.name} Proctored Coding Assessment: ${meta.dsaFocus.slice(0, 2).join(' & ')} with tight execution time limits.`,
-          unstatedPreferences: [
-            `Demonstrated excellence in ${meta.dsaFocus[0] || 'algorithmic problem solving'}`,
-            'Clean code architecture and edge-case handling',
-          ],
-          barDescription: `${meta.name} maintains a ${meta.typicalHiringBar.toLowerCase()} technical standard with focus on ${meta.dsaFocus.join(', ')}.`,
-        },
-      };
-    });
   }
 
   /**

@@ -31,12 +31,14 @@ interface AtsScrapersProps {
 }
 
 interface SupportedBoard {
+  companyId: string;
   company: string;
-  source: 'greenhouse' | 'lever';
+  provider: string;
   boardToken: string;
-  industry: string;
+  connectorStatus: 'supported_unverified' | 'unsupported';
+  verificationStatus: string;
+  isRealtimeEnabled: boolean;
   sampleRoles: string[];
-  typicalHiringBar: string;
 }
 
 export const AtsScrapers: React.FC<AtsScrapersProps> = ({ onJobsUpdated }) => {
@@ -146,6 +148,28 @@ We process &gt; 100,000 queries/sec with strict latency SLAs (&lt; 10ms).</p>
       if (onJobsUpdated) onJobsUpdated();
     } catch (err: any) {
       setScrapeError(err.message || 'Error running scraper');
+    } finally {
+      setIsScraping(false);
+    }
+  };
+
+  const handleRunCatalogBoard = async (companyId: string) => {
+    setIsScraping(true);
+    setScrapeError(null);
+    setScrapeResult(null);
+    try {
+      const res = await fetch('/api/scrapers/fetch-live', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ companyId, persistToDb: true }),
+      });
+      const data = await res.json();
+      if (!res.ok && res.status !== 207) throw new Error(data.message || data.error || 'Board fetch failed.');
+      setScrapeResult(data);
+      await fetchDbJobs();
+      onJobsUpdated?.();
+    } catch (error) {
+      setScrapeError(error instanceof Error ? error.message : 'Board fetch failed.');
     } finally {
       setIsScraping(false);
     }
@@ -330,14 +354,17 @@ We process &gt; 100,000 queries/sec with strict latency SLAs (&lt; 10ms).</p>
           {/* Preset Boards Grid */}
           <div className="space-y-3">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-bold text-slate-300">Configured Top-Tier Target Boards:</span>
-              <span className="text-[11px] text-slate-500 font-mono">Greenhouse & Lever Ingestion</span>
+              <span className="text-xs font-bold text-slate-300">Target company catalog (not verified integrations):</span>
+              <span className="text-[11px] text-slate-500 font-mono">{supportedBoards.length} catalog entries</span>
             </div>
+            <p className="text-[11px] text-slate-500">
+              Adapter support is not proof a company board works. Only a successful live check marks a board verified; sample roles are not current openings.
+            </p>
 
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
               {supportedBoards.map((board, idx) => (
                 <div
-                  key={idx}
+                  key={board.companyId}
                   className="p-4 bg-slate-900/90 rounded-2xl border border-slate-800 hover:border-indigo-500/40 transition-all space-y-3 flex flex-col justify-between"
                 >
                   <div className="space-y-1.5">
@@ -345,21 +372,28 @@ We process &gt; 100,000 queries/sec with strict latency SLAs (&lt; 10ms).</p>
                       <span className="text-sm font-bold text-slate-100">{board.company}</span>
                       <span
                         className={`px-2 py-0.5 rounded-md text-[10px] font-mono font-bold uppercase ${
-                          board.source === 'greenhouse'
+                          board.provider === 'greenhouse'
                             ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
-                            : 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30'
+                            : board.provider === 'lever' || board.provider === 'ashby'
+                              ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30'
+                              : 'bg-slate-800 text-slate-300 border border-slate-700'
                         }`}
                       >
-                        {board.source}
+                        {board.provider}
                       </span>
                     </div>
 
-                    <p className="text-[11px] text-slate-400">{board.industry}</p>
+                    <div className="text-[10px] font-semibold uppercase tracking-wide">
+                      <span className={board.isRealtimeEnabled ? 'text-emerald-400' : board.connectorStatus === 'unsupported' ? 'text-rose-300' : 'text-amber-300'}>
+                        {board.isRealtimeEnabled ? 'Verified live response' : board.connectorStatus === 'unsupported' ? 'No connector' : 'Not yet verified'}
+                      </span>
+                      {board.verificationStatus === 'failed' && <span className="ml-2 text-rose-300">Last fetch failed</span>}
+                    </div>
 
                     <div className="space-y-1 pt-1">
-                      <span className="text-[10px] text-slate-500 block">Typical Hiring Bar:</span>
+                      <span className="text-[10px] text-slate-500 block">Example roles (not live listings):</span>
                       <span className="text-xs font-semibold text-amber-300/90 block">
-                        {board.typicalHiringBar}
+                        {board.sampleRoles.slice(0, 2).join(', ') || 'None listed'}
                       </span>
                     </div>
                   </div>
@@ -369,8 +403,8 @@ We process &gt; 100,000 queries/sec with strict latency SLAs (&lt; 10ms).</p>
                       /{board.boardToken}
                     </span>
                     <button
-                      onClick={() => handleRunScraper(board.source, board.boardToken, board.company)}
-                      disabled={isScraping}
+                      onClick={() => handleRunCatalogBoard(board.companyId)}
+                      disabled={isScraping || board.connectorStatus === 'unsupported'}
                       className="px-3 py-1.5 bg-slate-800 hover:bg-cyan-600 text-slate-200 hover:text-white text-xs font-semibold rounded-xl flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50"
                     >
                       <Play className="w-3 h-3 fill-current" />
@@ -448,7 +482,7 @@ We process &gt; 100,000 queries/sec with strict latency SLAs (&lt; 10ms).</p>
                 <div className="flex items-center space-x-2">
                   <CheckCircle2 className="w-5 h-5 text-emerald-400" />
                   <h3 className="text-sm font-bold text-slate-100">
-                    Ingestion Succeeded: {scrapeResult.company || 'Batch Targets'} ({scrapeResult.jobsCount || scrapeResult.totalIngested} Jobs)
+                    {scrapeResult.success === false ? 'Ingestion completed with issues' : 'Ingestion completed'}: {scrapeResult.company || 'Board batch'} ({scrapeResult.totalJobsFetched ?? scrapeResult.jobsCount ?? scrapeResult.totalIngested ?? 0} jobs)
                   </h3>
                 </div>
 
@@ -460,6 +494,22 @@ We process &gt; 100,000 queries/sec with strict latency SLAs (&lt; 10ms).</p>
               </div>
 
               <div className="space-y-3">
+                {(scrapeResult.companyResults || []).map((result: {
+                  company: string;
+                  status: string;
+                  totalFetched: number;
+                  error?: string;
+                }, idx: number) => (
+                  <div key={`${result.company}-${idx}`} className="p-3 bg-slate-950 rounded-xl border border-slate-800 text-xs">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="font-semibold text-slate-200">{result.company}</span>
+                      <span className={result.status === 'SUCCESS' || result.status === 'EMPTY' ? 'text-emerald-300' : 'text-amber-300'}>
+                        {result.status} · {result.totalFetched} received
+                      </span>
+                    </div>
+                    {result.error && <p className="mt-1 text-rose-300">{result.error}</p>}
+                  </div>
+                ))}
                 {(scrapeResult.jobs || []).slice(0, 3).map((job: any, idx: number) => (
                   <div key={idx} className="p-4 bg-slate-950 rounded-2xl border border-slate-800 space-y-2">
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
@@ -760,6 +810,15 @@ We process &gt; 100,000 queries/sec with strict latency SLAs (&lt; 10ms).</p>
                     <div className="space-y-0.5">
                       <div className="flex items-center space-x-2">
                         <span className="text-base font-bold text-slate-100">{job.title}</span>
+                        {job.dataOrigin && job.dataOrigin !== 'live' && (
+                          <span className={`ml-2 text-[9px] font-bold px-1.5 py-0.5 rounded border ${
+                            job.dataOrigin === 'demo'
+                              ? 'text-amber-300 bg-amber-950/40 border-amber-800/60'
+                              : 'text-slate-300 bg-slate-800 border-slate-700'
+                          }`}>
+                            {job.dataOrigin === 'demo' ? 'DEMO' : 'MANUAL'}
+                          </span>
+                        )}
                         <span
                           className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold uppercase ${
                             job.source === 'greenhouse'

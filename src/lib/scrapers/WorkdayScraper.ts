@@ -11,6 +11,7 @@ import {
   extractStatedRequirements,
   extractInformalBarHints,
 } from '../normalizer';
+import { fetchAtsResponse, parseAtsJson, parsePostedAt } from './atsHttp';
 
 export interface RawWorkdayJob {
   bulletFields?: string[];
@@ -32,69 +33,90 @@ export interface RawWorkdayJob {
   postedOn?: string;
 }
 
+interface WorkdayBoardResponse {
+  jobPostings?: RawWorkdayJob[];
+  total?: number;
+}
+
 export class WorkdayScraper {
   /**
    * Fetches and normalizes jobs from Workday public CXS endpoints
    */
-  public async fetchBoard(boardToken: string, companyDisplayName?: string): Promise<NormalizedAtsJob[]> {
+  public async fetchBoard(
+    boardToken: string,
+    companyDisplayName?: string,
+    careersUrl?: string
+  ): Promise<NormalizedAtsJob[]> {
     const company = companyDisplayName || boardToken.charAt(0).toUpperCase() + boardToken.slice(1);
-    const host = boardToken.includes('.') ? boardToken : `${boardToken}.wd5.myworkdayjobs.com`;
-    const url = `https://${host}/wday/cxs/${boardToken}/External/jobs`;
+    if (!careersUrl) throw new Error(`No verified Workday careers URL is configured for ${company}.`);
+    const careers = new URL(careersUrl);
+    if (!careers.hostname.endsWith('.myworkdayjobs.com')) {
+      throw new Error(`The configured careers URL for ${company} is not a Workday-hosted board.`);
+    }
+    const site = careers.pathname.split('/').filter(Boolean)[0];
+    if (!site) throw new Error(`The Workday site name is missing from ${company}'s careers URL.`);
+    const tenant = careers.hostname.split('.')[0];
+    const apiUrl = `https://${careers.hostname}/wday/cxs/${encodeURIComponent(tenant)}/${encodeURIComponent(site)}/jobs`;
+    const pageSize = 20;
+    const maxJobs = 500;
+    const jobs: RawWorkdayJob[] = [];
 
-    try {
-      const response = await fetch(url, {
+    for (let offset = 0; offset <= maxJobs; offset += pageSize) {
+      const limit = Math.min(pageSize, maxJobs + 1 - offset);
+      const response = await fetchAtsResponse('workday', apiUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json',
-          'User-Agent': 'AI-Internship-Scout/1.0',
+          'User-Agent': 'InternAtlas/1.0 (job-board integration)',
         },
         body: JSON.stringify({
           appliedFacets: {},
-          limit: 20,
-          offset: 0,
+          limit,
+          offset,
           searchText: 'internship',
         }),
       });
-
-      if (!response.ok) {
-        return [];
+      const page = await parseAtsJson<WorkdayBoardResponse>(response, 'workday');
+      if (!Array.isArray(page.jobPostings)) throw new Error('Workday returned an invalid job-board payload.');
+      jobs.push(...page.jobPostings);
+      if (jobs.length > maxJobs) {
+        throw new Error(`Workday board exceeded the ${maxJobs}-job ingestion safety limit.`);
       }
-
-      const data: any = await response.json();
-      const rawJobs: RawWorkdayJob[] = data.jobPostings || [];
-
-      if (!Array.isArray(rawJobs) || rawJobs.length === 0) {
-        return [];
+      if (
+        page.jobPostings.length < limit ||
+        (typeof page.total === 'number' && offset + page.jobPostings.length >= page.total)
+      ) {
+        break;
       }
-
-      return rawJobs.map((job) => this.normalizeJob(job, company));
-    } catch (err: any) {
-      // Graceful error isolation on network/timeout failure
-      return [];
     }
+    return jobs.map((job) => this.normalizeJob(job, company, careers));
   }
 
   /**
    * Normalizes a raw Workday job object into a standard structured ATS job
    */
-  public normalizeJob(raw: RawWorkdayJob, companyName: string): NormalizedAtsJob {
+  public normalizeJob(raw: RawWorkdayJob, companyName: string, careersUrl?: URL): NormalizedAtsJob {
     const info = raw.jobPostingInfo || {};
     const rawDescription = info.jobDescription || '';
     const cleanDescription = sanitizeHtml(rawDescription);
-    const location = info.location || raw.locationsText || 'Bangalore, Hyderabad';
-    const jobTitle = info.title || raw.title || 'Software Engineering Intern 2027';
+    const location = info.location || raw.locationsText || 'Location not specified';
+    const jobTitle = info.title || raw.title || '';
     const isRemote = detectRemote(jobTitle, location, cleanDescription);
-    const externalId = String(info.id || raw.id || raw.externalPath || Math.random().toString(36).substring(7));
-    const directApplyUrl = info.externalUrl || `https://${companyName.toLowerCase().replace(/[^a-z0-9]/g, '')}.wd5.myworkdayjobs.com/External/${externalId}`;
+    const externalId = String(info.id || raw.id || '');
+    const directApplyUrl = info.externalUrl || (
+      careersUrl && raw.externalPath
+        ? new URL(raw.externalPath.replace(/^\/+/, ''), `${careersUrl.origin}/${careersUrl.pathname.split('/').filter(Boolean)[0]}/`).toString()
+        : ''
+    );
     const reqId = extractReqId(info.jobReqId || externalId, directApplyUrl, rawDescription);
-    const postedAt = info.postedOn || raw.postedOn || new Date().toISOString();
+    const postedAt = parsePostedAt(info.postedOn || raw.postedOn || info.startDate);
 
     const statedRequirements = extractStatedRequirements(cleanDescription || jobTitle);
     const informalBar = extractInformalBarHints(companyName, jobTitle, cleanDescription);
 
     return {
-      source: 'workday' as any,
+      source: 'workday',
       externalId,
       reqId,
       company: companyName,

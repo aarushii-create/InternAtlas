@@ -51,7 +51,7 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
   const getPageTitle = () => {
     switch (activeTab) {
       case 'overview':
-        return { title: 'Command Center', subtitle: 'Live Qualified Internship Matches & Scoring' };
+        return { title: 'Command Center', subtitle: 'Personalized Matches from Saved Resumes and Job Records' };
       case 'preferences':
         return { title: 'Target Preferences', subtitle: 'Target Roles, Locations, Tiers & Thresholds' };
       case 'resume':
@@ -153,7 +153,7 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
           <span className="text-slate-300 font-medium">4 ATS Feeds Active</span>
           <span className="text-slate-400">•</span>
           <span className="text-slate-400 font-mono">
-            {stats?.jobsCount ? `${stats.jobsCount} Indexed` : 'Auto-Sync'}
+            {stats ? `${stats.jobsCount} Jobs Indexed` : 'Job count unavailable'}
           </span>
         </div>
 

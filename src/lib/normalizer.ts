@@ -42,7 +42,7 @@ export interface RawLeverJob {
 }
 
 export interface NormalizedAtsJob {
-  source: 'greenhouse' | 'lever';
+  source: 'greenhouse' | 'lever' | 'ashby' | 'workday';
   externalId: string;
   reqId: string;
   company: string;

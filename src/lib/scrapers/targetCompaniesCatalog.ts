@@ -1,8 +1,8 @@
 /**
  * InternAtlas - Target Company Master Catalog
  * Full categorization of Tech Giants, Quant/HFT, Indian Unicorns, AI & Analytics, and Enterprise IT.
- * Provides ATS configurations (Greenhouse, Lever, Ashby, Workday, SmartRecruiters, REST/GraphQL)
- * for real-time live web scraping, deterministic deduplication, and 2-Layer RAG matching.
+ * Provides company metadata. ATS labels are catalog hints, not proof that a board is
+ * verified or that its terms permit automated ingestion.
  */
 
 export type CompanyCategory =
@@ -26,7 +26,7 @@ export interface TargetCompanyMetadata {
   category: CompanyCategory;
   tier: string;
   atsProvider: AtsProviderType;
-  boardToken: string; // token used in Greenhouse / Lever / Ashby endpoints
+  boardToken: string; // connector-specific board token; must be validated against the target board
   careersUrl: string;
   primaryLocations: string[];
   sampleRoles: string[];
@@ -34,7 +34,7 @@ export interface TargetCompanyMetadata {
   dsaFocus: string[];
   compensationRange: string;
   internshipSeasons: string[];
-  isRealtimeEnabled: boolean;
+  isRealtimeEnabled: boolean; // legacy catalog flag; API responses derive availability from implemented adapters
 }
 
 export const TARGET_COMPANIES_CATALOG: TargetCompanyMetadata[] = [

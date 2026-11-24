@@ -12,6 +12,7 @@ import {
   extractStatedRequirements,
   extractInformalBarHints,
 } from '../normalizer';
+import { fetchAtsResponse, parseAtsJson, parsePostedAt } from './atsHttp';
 
 export class LeverScraper {
   private readonly baseUrl: string = 'https://api.lever.co/v0/postings';
@@ -23,29 +24,15 @@ export class LeverScraper {
     const company = companyDisplayName || formatCompanyName(companySite);
     const url = `${this.baseUrl}/${encodeURIComponent(companySite)}?mode=json`;
 
-    try {
-      const response = await fetch(url, {
-        headers: {
-          Accept: 'application/json',
-          'User-Agent': 'AI-Internship-Scout/1.0',
-        },
-      });
-
-      if (!response.ok) {
-        console.warn(`Lever API request returned.`);
-        return [];
-      }
-
-      const data = await response.json();
-      if (!Array.isArray(data)) {
-        return [];
-      }
-
-      return data.map((job: RawLeverJob) => this.normalizeJob(job, company));
-    } catch (err: any) {
-      console.warn(`Network error fetching Lever board.`);
-      return [];
-    }
+    const response = await fetchAtsResponse('lever', url, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'InternAtlas/1.0 (job-board integration)',
+      },
+    });
+    const data = await parseAtsJson<RawLeverJob[]>(response, 'lever');
+    if (!Array.isArray(data)) throw new Error('Lever returned an invalid job-board payload.');
+    return data.map((job) => this.normalizeJob(job, company));
   }
 
   /**
@@ -67,21 +54,17 @@ export class LeverScraper {
     }
 
     const cleanDescription = sanitizeHtml(rawDescription);
-    const location = raw.categories?.location || raw.categories?.allLocations?.join(', ') || 'New York, NY';
-    const jobTitle = raw.text || 'Engineering Intern';
+    const location = raw.categories?.location || raw.categories?.allLocations?.join(', ') || 'Location not specified';
+    const jobTitle = raw.text || '';
     const isRemote =
       raw.workplaceType === 'remote' ||
       raw.categories?.commitment?.toLowerCase().includes('remote') ||
       detectRemote(jobTitle, location, cleanDescription);
 
     const externalId = String(raw.id);
-    const directApplyUrl = raw.applyUrl || raw.hostedUrl || `https://jobs.lever.co/${companyName.toLowerCase().replace(/\s+/g, '')}/${externalId}`;
+    const directApplyUrl = raw.applyUrl || raw.hostedUrl || '';
     const reqId = extractReqId(raw.reqCode || raw.id, directApplyUrl, rawDescription);
-    const postedAt = raw.createdAt
-      ? typeof raw.createdAt === 'number'
-        ? new Date(raw.createdAt).toISOString()
-        : new Date(raw.createdAt).toISOString()
-      : new Date().toISOString();
+    const postedAt = parsePostedAt(raw.createdAt);
 
     const statedRequirements = extractStatedRequirements(cleanDescription || jobTitle);
     const informalBar = extractInformalBarHints(companyName, jobTitle, cleanDescription);

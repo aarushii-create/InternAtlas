@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Lock, Mail, User, ShieldCheck, Key, ArrowRight, CheckCircle2, AlertCircle, Sparkles } from 'lucide-react';
+import { Lock, Mail, User, ShieldCheck, ArrowRight, CheckCircle2, AlertCircle, Sparkles } from 'lucide-react';
 import { User as UserType } from '../types';
 
 interface AuthModalProps {
@@ -10,22 +10,13 @@ interface AuthModalProps {
 
 export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuccess }) => {
   const [isLogin, setIsLogin] = useState<boolean>(true);
-  const [email, setEmail] = useState<string>('alex.rivera@stanford.edu');
-  const [password, setPassword] = useState<string>('password123');
+  const [email, setEmail] = useState<string>('');
+  const [password, setPassword] = useState<string>('');
   const [fullName, setFullName] = useState<string>('');
-  const [tenantId, setTenantId] = useState<string>('tenant-alex-rivera');
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
   if (!isOpen) return null;
-
-  const handleQuickPreset = (presetEmail: string, presetTenant: string, name: string) => {
-    setEmail(presetEmail);
-    setPassword('password123');
-    setTenantId(presetTenant);
-    setFullName(name);
-    setError(null);
-  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -35,7 +26,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
     const endpoint = isLogin ? '/api/auth/login' : '/api/auth/register';
     const body = isLogin
       ? { email, password }
-      : { email, password, fullName, tenantId };
+      : { email, password, fullName };
 
     try {
       const res = await fetch(endpoint, {
@@ -54,8 +45,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
         throw new Error(data.message || 'Authentication error');
       }
 
-      // Save token
-      localStorage.setItem('scout_jwt_token', data.token);
       onAuthSuccess(data.token, data.user);
       onClose();
     } catch (err: any) {
@@ -93,32 +82,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
           </button>
         </div>
 
-        {/* Preset Quick Login Buttons */}
-        <div className="space-y-2">
-          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block font-mono">
-            Quick Seed Account Login:
-          </span>
-          <div className="grid grid-cols-2 gap-2">
-            <button
-              type="button"
-              onClick={() => handleQuickPreset('alex.rivera@stanford.edu', 'tenant-alex-rivera', 'Alex Rivera')}
-              className="p-2.5 bg-slate-950 hover:bg-slate-800 border border-indigo-500/30 rounded-xl text-left space-y-0.5 transition-all cursor-pointer"
-            >
-              <span className="text-xs font-bold text-indigo-300 block truncate">Alex Rivera</span>
-              <span className="text-[10px] text-slate-400 block font-mono">Stanford CS</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => handleQuickPreset('jordan.chen@berkeley.edu', 'tenant-jordan-chen', 'Jordan Chen')}
-              className="p-2.5 bg-slate-950 hover:bg-slate-800 border border-cyan-500/30 rounded-xl text-left space-y-0.5 transition-all cursor-pointer"
-            >
-              <span className="text-xs font-bold text-cyan-300 block truncate">Jordan Chen</span>
-              <span className="text-[10px] text-slate-400 block font-mono">UC Berkeley EECS</span>
-            </button>
-          </div>
-        </div>
-
         {/* Error Alert */}
         {error && (
           <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-300 text-xs flex items-center gap-2">
@@ -145,19 +108,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
                 />
               </div>
 
-              <div className="space-y-1">
-                <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
-                  <Key className="w-3.5 h-3.5 text-cyan-400" /> Tenant Identifier
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={tenantId}
-                  onChange={(e) => setTenantId(e.target.value)}
-                  placeholder="e.g. tenant-stanford"
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-100 font-mono focus:border-cyan-500 focus:outline-none"
-                />
-              </div>
             </>
           )}
 
@@ -182,6 +132,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthSuc
             <input
               type="password"
               required
+              minLength={isLogin ? 1 : 12}
+              maxLength={128}
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="••••••••"

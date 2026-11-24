@@ -3,14 +3,22 @@
  * Full multi-tenant database logic, vector similarity endpoints, and Vite dev middleware.
  */
 
-import express from 'express';
+import 'dotenv/config';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
+import express, { Request } from 'express';
 import path from 'path';
 import fs from 'fs';
 import multer from 'multer';
-import mammoth from 'mammoth';
 import { createServer as createViteServer } from 'vite';
 import { db, generateDeterministicEmbedding, calculateCosineSimilarity } from './src/db/database';
-import { parseResume, generateResumeVectors } from './src/lib/resumeParser';
+import { PostgresPersistence } from './src/db/postgresPersistence';
+import {
+  extractResumeText,
+  MAX_RESUME_BYTES,
+  parseResume,
+  generateResumeVectors,
+  ResumeProcessingError,
+} from './src/lib/resumeParser';
 import { GreenhouseScraper } from './src/lib/scrapers/GreenhouseScraper';
 import { LeverScraper } from './src/lib/scrapers/LeverScraper';
 import { AshbyScraper } from './src/lib/scrapers/AshbyScraper';
@@ -57,10 +65,18 @@ import {
   loginSchema,
   preferencesSchema,
   profileUpdateSchema,
+  resumeCreateSchema,
+  applicationStatusSchema,
+  requestIdSchema,
+  feedbackActionSchema,
+  feedbackRecordSchema,
+  alertConfigurationSchema,
 } from './src/lib/validations';
 import {
   generateUserToken,
   authenticateToken,
+  setAuthCookie,
+  clearAuthCookie,
   enforceTenantAndUserSecurity,
   AuthenticatedRequest,
 } from './src/middleware/auth';
@@ -73,19 +89,215 @@ import {
 } from './src/middleware/rateLimiter';
 import { costGuard } from './src/lib/rateLimiter';
 
-import * as pdfParseModule from 'pdf-parse';
-const pdfParse: (buf: Buffer) => Promise<{ text: string }> = (pdfParseModule as any).default || pdfParseModule;
-
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB file limit
+  limits: { fileSize: MAX_RESUME_BYTES },
 });
+const resumeUpload = (req: Request, res: express.Response, next: express.NextFunction) => {
+  upload.single('file')(req, res, (error: unknown) => {
+    if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({ error: 'Resume Processing Error', message: 'Resume files must be 10 MB or smaller.' });
+    }
+    if (error) {
+      return res.status(400).json({ error: 'Resume Processing Error', message: 'The uploaded file could not be received.' });
+    }
+    next();
+  });
+};
+
+function isLiveScrapingEnabled(): boolean {
+  return process.env.NODE_ENV !== 'production' ||
+    (process.env.ENABLE_LIVE_SCRAPING === 'true' && process.env.ATS_TERMS_REVIEWED === 'true');
+}
+
+function isScraperSchedulerEnabled(): boolean {
+  return process.env.ENABLE_LIVE_SCRAPING === 'true' &&
+    process.env.ATS_TERMS_REVIEWED === 'true' &&
+    process.env.ENABLE_SCRAPER_SCHEDULER === 'true';
+}
 
 async function startServer() {
-  const app = express();
-  const PORT = 3000;
+  const persistence = new PostgresPersistence(process.env.DATABASE_URL);
+  await persistence.initialize(db, userFeedbackStore);
 
-  app.use(express.json());
+  const app = express();
+  const PORT = Number(process.env.PORT || 3000);
+
+  if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+    throw new Error(`Invalid PORT value "${process.env.PORT}". Expected an integer from 1 to 65535.`);
+  }
+
+  app.use(express.json({ limit: '1mb' }));
+  app.use('/api', (req, res, next) => {
+    if (
+      req.method === 'POST' &&
+      /^\/queue\/schedules(?:\/.*)?$/.test(req.path) &&
+      !isScraperSchedulerEnabled()
+    ) {
+      return res.status(503).json({
+        error: 'Scheduled live ingestion is disabled.',
+        message: 'Enable live ingestion only after source-specific terms review.',
+      });
+    }
+    if (
+      (req.method === 'GET' && req.path === '/health') ||
+      (req.method === 'POST' && (
+        req.path === '/auth/register' ||
+        req.path === '/auth/login' ||
+        req.path === '/auth/logout' ||
+        req.path === '/feedback/telegram-webhook'
+      ))
+    ) {
+      return next();
+    }
+
+    authenticateToken(req as AuthenticatedRequest, res, () => {
+      const authenticatedRequest = req as AuthenticatedRequest;
+      const user = authenticatedRequest.user
+        ? db.getUserById(authenticatedRequest.user.userId, authenticatedRequest.user.tenantId)
+        : undefined;
+      const isProductionDemoAccount = process.env.NODE_ENV === 'production' && (
+        user?.email === 'alex.rivera@stanford.edu' || user?.email === 'jordan.chen@berkeley.edu'
+      );
+      if (!authenticatedRequest.user || !user || isProductionDemoAccount) {
+        return res.status(401).json({
+          error: 'Unauthorized',
+          message: 'The account for this session is no longer available. Please sign in again.',
+          code: 'AUTH_SESSION_REVOKED',
+        });
+      }
+
+      const adminOnlyMutation =
+        (req.method === 'POST' && /^\/(?:scrapers\/(?:fetch-live|greenhouse|lever|run-all)|jobs(?:\/(?:cleanup|simulate-stale-bloat|mark-inactive|dedup-reset-stats))?|companies\/insights|rag\/layer2\/chunks\/ingest|db\/seed|alerts\/(?:config|dispatch-test|test-connection)|queue(?:\/.*)?)$/.test(req.path)) ||
+        ((req.method === 'PUT' || req.method === 'PATCH' || req.method === 'DELETE') && /^\/queue(?:\/.*)?$/.test(req.path)) ||
+        (req.method === 'GET' && req.path === '/queue/proxies') ||
+        (/\/(?:test-suite(?:\/.*)?|simulate-pipeline|load-benchmark)$/.test(req.path));
+      if (adminOnlyMutation) {
+        const administrators = new Set(
+          (process.env.ADMIN_USER_IDS || '').split(',').map((id) => id.trim()).filter(Boolean)
+        );
+        if (!administrators.has(user.id)) {
+          return res.status(403).json({
+            error: 'Forbidden',
+            message: 'Administrator permission is required for this operation.',
+            code: 'ADMIN_PERMISSION_REQUIRED',
+          });
+        }
+      }
+
+      const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+        ? req.body as Record<string, unknown>
+        : {};
+      if (req.body !== undefined && (!req.body || typeof req.body !== 'object' || Array.isArray(req.body))) {
+        return res.status(400).json({ error: 'Validation Error', message: 'Request body must be a JSON object.' });
+      }
+      for (const value of Object.values(req.query)) {
+        if (typeof value !== 'string') {
+          return res.status(400).json({ error: 'Validation Error', message: 'Query parameters must be single string values.' });
+        }
+      }
+      for (const [name, value] of Object.entries({ ...req.query, ...body })) {
+        if (name === 'userId' || name === 'tenantId') {
+          if (typeof value !== 'string') {
+            return res.status(400).json({ error: 'Validation Error', message: `${name} must be a string.` });
+          }
+          const expectedValue = name === 'userId' ? user.id : user.tenantId;
+          if (value !== expectedValue) {
+            return res.status(403).json({
+              error: 'Forbidden',
+              message: 'The requested account scope does not match the authenticated account.',
+              code: 'USER_ISOLATION_VIOLATION',
+            });
+          }
+        }
+
+        if (['userId', 'tenantId', 'resumeId', 'jobId', 'candidateId'].includes(name)) {
+          const parsedId = requestIdSchema.safeParse(value);
+          if (!parsedId.success) {
+            return res.status(400).json({ error: 'Validation Error', message: `${name} is invalid.` });
+          }
+        }
+        if (name === 'candidateId' && value !== user.id) {
+          return res.status(403).json({
+            error: 'Forbidden',
+            message: 'You may only access feedback associated with your own account.',
+            code: 'USER_ISOLATION_VIOLATION',
+          });
+        }
+      }
+
+      const feedbackCandidateFromPath = /^\/feedback\/(?:profile|reset)\/([^/]+)$/.exec(req.path)?.[1];
+      if (feedbackCandidateFromPath && feedbackCandidateFromPath !== user.id) {
+        return res.status(403).json({
+          error: 'Forbidden',
+          message: 'You may only access feedback associated with your own account.',
+          code: 'USER_ISOLATION_VIOLATION',
+        });
+      }
+
+      const resumeIdFromPath = /^\/(?:resumes|resume\/(?:modular-vectors|delta\/audit|delta\/reset))\/([^/]+)$/.exec(req.path)?.[1];
+      const suppliedResumeId = body.resumeId ?? req.query.resumeId ?? resumeIdFromPath;
+      if (suppliedResumeId !== undefined) {
+        const parsedResumeId = requestIdSchema.safeParse(suppliedResumeId);
+        if (!parsedResumeId.success) {
+          return res.status(400).json({ error: 'Validation Error', message: 'resumeId is invalid.' });
+        }
+        const resume = db.getResumeById(parsedResumeId.data, user.tenantId);
+        if (resume && resume.userId !== user.id) {
+          return res.status(403).json({
+            error: 'Forbidden',
+            message: 'You do not have permission to access this resume.',
+            code: 'USER_ISOLATION_VIOLATION',
+          });
+        }
+      }
+
+      next();
+    });
+  });
+  const getAuthenticatedResumes = (req: Request) => {
+    const identity = (req as AuthenticatedRequest).user;
+    return identity ? db.getResumes(identity.tenantId, identity.userId) : [];
+  };
+  const requireOwnedResume = (req: Request, res: express.Response, value: unknown): string | undefined => {
+    const identity = (req as AuthenticatedRequest).user;
+    const parsedId = requestIdSchema.safeParse(value);
+    if (!parsedId.success) {
+      res.status(400).json({ error: 'Validation Error', message: 'A valid resume ID is required.' });
+      return undefined;
+    }
+    if (!identity) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return undefined;
+    }
+    const resume = db.getResumeById(parsedId.data, identity.tenantId);
+    if (!resume || resume.userId !== identity.userId) {
+      res.status(404).json({ error: 'Resume not found.' });
+      return undefined;
+    }
+    return parsedId.data;
+  };
+
+  app.use((req, res, next) => {
+    const originalJson = res.json.bind(res);
+    const shouldPersist = req.method !== 'GET' || req.path === '/api/dashboard/overview';
+    if (shouldPersist) {
+      res.json = ((body: unknown) => {
+        void persistence.persist(db, userFeedbackStore)
+          .then(() => originalJson(body))
+          .catch((error: unknown) => {
+            console.error('Failed to persist application state:', error);
+            if (!res.headersSent) {
+              res.status(500);
+              originalJson({ error: 'Database persistence failed' });
+            }
+          });
+
+        return res;
+      }) as typeof res.json;
+    }
+    next();
+  });
 
   // 1. Health Check & API Cost/Rate Limit Guard Status
   app.get('/api/health', (req, res) => {
@@ -118,9 +330,10 @@ async function startServer() {
     }
 
     try {
-      const { email, password, fullName, tenantId, avatarUrl } = parseResult.data;
-      const user = db.registerUser({ email, password, fullName, tenantId, avatarUrl });
+      const { email, password, fullName, avatarUrl } = parseResult.data;
+      const user = db.registerUser({ email, password, fullName, tenantId: `tenant-${randomUUID()}`, avatarUrl });
       const token = generateUserToken(user);
+      setAuthCookie(res, token);
 
       // Create default preferences
       db.upsertPreferences({
@@ -170,6 +383,7 @@ async function startServer() {
     }
 
     const token = generateUserToken(user);
+    setAuthCookie(res, token);
     const { passwordHash, ...safeUser } = user;
 
     res.json({
@@ -178,6 +392,11 @@ async function startServer() {
       expiresIn: '7d',
       message: 'Login successful',
     });
+  });
+
+  app.post('/api/auth/logout', (_req, res) => {
+    clearAuthCookie(res);
+    res.json({ success: true });
   });
 
   // 3. Get Current Authenticated User Profile (Protected by JWT)
@@ -191,9 +410,12 @@ async function startServer() {
 
     const preferences = db.getPreferences(user.id, user.tenantId);
     const resumes = db.getResumes(user.tenantId, user.id);
+    const token = generateUserToken(user);
+    setAuthCookie(res, token);
 
     const { passwordHash, ...safeUser } = user;
     res.json({
+      token,
       user: safeUser,
       tenantId: req.user.tenantId,
       preferences,
@@ -257,51 +479,32 @@ async function startServer() {
   // ==========================================
 
   // 1. Resume Parsing & Multi-Vector Generation Endpoint (Rate-Limited, Supports PDF, DocX, Text Upload)
-  app.post('/api/resumes/parse', aiRateLimiter, upload.single('file'), async (req, res) => {
+  app.post('/api/resumes/parse', authenticateToken, aiRateLimiter, resumeUpload, async (req, res) => {
     try {
       let rawText = '';
       let fileName = 'Uploaded Resume';
 
       if (req.file) {
         fileName = req.file.originalname;
-        const mimeType = req.file.mimetype;
-        const ext = path.extname(fileName).toLowerCase();
-
-        if (mimeType === 'application/pdf' || ext === '.pdf') {
-          const pdfData = await pdfParse(req.file.buffer);
-          rawText = pdfData.text;
-        } else if (
-          mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
-          ext === '.docx' ||
-          ext === '.doc'
-        ) {
-          const docxResult = await mammoth.extractRawText({ buffer: req.file.buffer });
-          rawText = docxResult.value;
-        } else {
-          rawText = req.file.buffer.toString('utf-8');
-        }
+        rawText = await extractResumeText(req.file.buffer, fileName, req.file.mimetype);
       } else if (req.body && req.body.rawText) {
-        rawText = req.body.rawText;
-        if (req.body.title) fileName = req.body.title;
+        if (typeof req.body.rawText !== 'string') {
+          throw new ResumeProcessingError('Resume text must be a string.');
+        }
+        rawText = req.body.rawText.trim();
+        if (rawText.length > 100_000) {
+          throw new ResumeProcessingError('Resume text exceeds the 100,000 character limit.', 413);
+        }
+        if (req.body.title && typeof req.body.title === 'string') fileName = req.body.title;
       } else {
-        return res.status(400).json({
-          error: 'Bad Request',
-          message: 'No resume file uploaded or rawText string provided in payload.',
-        });
+        throw new ResumeProcessingError('Upload a resume file or provide resume text.');
       }
 
-      if (!rawText || rawText.trim().length === 0) {
-        return res.status(400).json({
-          error: 'Empty Content',
-          message: 'Unable to extract legible text from uploaded file.',
-        });
-      }
+      if (!rawText) throw new ResumeProcessingError('Resume text is empty.');
 
-      // 2. Parse locally with the deterministic resume parser
+      // Resume parsing and embedding are local; no resume text is sent to an AI provider.
       const parsedData = parseResume(rawText);
-
-      // 3. Generate multi-vector embeddings (Full Resume, Modular Skills, Modular Experience)
-      const vectors = await generateResumeVectors(rawText, parsedData);
+      const vectors = generateResumeVectors(rawText, parsedData);
 
       res.json({
         success: true,
@@ -310,11 +513,16 @@ async function startServer() {
         parsedData,
         vectors,
       });
-    } catch (err: any) {
-      console.error('Error parsing resume in Phase 3 endpoint:', err);
-      res.status(500).json({
-        error: 'Resume Parsing Failed',
-        message: err.message || 'Failed to process and vectorize resume document.',
+    } catch (error: unknown) {
+      if (error instanceof ResumeProcessingError) {
+        return res.status(error.statusCode).json({ error: 'Resume Processing Error', message: error.message });
+      }
+      if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ error: 'Resume Processing Error', message: 'Resume files must be 10 MB or smaller.' });
+      }
+      return res.status(400).json({
+        error: 'Resume Processing Error',
+        message: 'The resume could not be processed. Check that the file is valid and try again.',
       });
     }
   });
@@ -324,14 +532,14 @@ async function startServer() {
     if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
 
     try {
-      const { title, rawText, parsedData, isPrimary, fullTextVector, skillsVector, experienceVector } = req.body;
-
-      if (!rawText || !parsedData) {
+      const parsedBody = resumeCreateSchema.safeParse(req.body);
+      if (!parsedBody.success) {
         return res.status(400).json({
           error: 'Validation Error',
-          message: 'rawText and parsedData are required to persist resume in DB.',
+          details: parsedBody.error.flatten().fieldErrors,
         });
       }
+      const { title, rawText, parsedData, isPrimary, fullTextVector, skillsVector, experienceVector } = parsedBody.data;
 
       const newResume = db.createResume({
         userId: req.user.userId,
@@ -391,6 +599,19 @@ async function startServer() {
     res.json(resume);
   });
 
+  app.delete('/api/resumes/:id', authenticateToken, (req: AuthenticatedRequest, res) => {
+    if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
+    const resume = db.getResumeById(req.params.id, req.user.tenantId);
+    if (!resume || resume.userId !== req.user.userId) {
+      return res.status(404).json({ error: 'Resume not found.' });
+    }
+    if (!db.deleteResume(resume.id, req.user.tenantId, req.user.userId)) {
+      return res.status(404).json({ error: 'Resume not found.' });
+    }
+    dynamicResumeEngine.deleteResumeData(resume.id);
+    return res.json({ success: true });
+  });
+
   // ==========================================
   // PHASE 4: TARGET JOB BOARD SCRAPERS (LIVE WEB & MULTI-ATS INTEGRATION)
   // ==========================================
@@ -423,7 +644,15 @@ async function startServer() {
       totalCount: TARGET_COMPANIES_CATALOG.length,
       filteredCount: companies.length,
       categories: categoryStats,
-      companies,
+      companies: companies.map((company) => ({
+        ...company,
+        isRealtimeEnabled: liveScraperEngine.isBoardVerified(company.id),
+        connectorStatus: liveScraperEngine.hasConfiguredConnector(company)
+          ? 'supported_unverified'
+          : 'unsupported',
+        verificationStatus: liveScraperEngine.getBoardHealth().find((health) => health.companyId === company.id)?.verificationStatus ?? 'not_checked',
+        syntheticDataAvailable: false,
+      })),
     });
   });
 
@@ -431,6 +660,12 @@ async function startServer() {
   app.post('/api/scrapers/fetch-live', scraperRateLimiter, async (req, res) => {
     try {
       const { companyId, companyName, category, persistToDb = true } = req.body;
+      if (!isLiveScrapingEnabled()) {
+        return res.status(503).json({
+          error: 'Live job ingestion is disabled.',
+          message: 'Production live scraping requires ENABLE_LIVE_SCRAPING=true and ATS_TERMS_REVIEWED=true after source-specific terms review.',
+        });
+      }
 
       let targetCompanies = TARGET_COMPANIES_CATALOG;
       if (companyId) {
@@ -455,13 +690,27 @@ async function startServer() {
 
       for (const comp of targetCompanies) {
         const scrapeResult = await liveScraperEngine.scrapeCompany(comp);
+        const inactiveCount = persistToDb && scrapeResult.completeSnapshot &&
+          (scrapeResult.status === 'SUCCESS' || scrapeResult.status === 'EMPTY')
+          ? db.deactivateMissingBoardJobs(
+              comp.name,
+              scrapeResult.provider === 'greenhouse' || scrapeResult.provider === 'lever'
+                ? scrapeResult.provider
+                : 'custom',
+              scrapeResult.jobs.map((job) => job.externalId)
+            )
+          : 0;
         results.push({
+          companyId: comp.id,
           company: comp.name,
           category: comp.category,
           atsProvider: comp.atsProvider,
           totalFetched: scrapeResult.totalFetched,
           newUniqueJobs: scrapeResult.newUniqueJobs,
           status: scrapeResult.status,
+          error: scrapeResult.error,
+          completeSnapshot: scrapeResult.completeSnapshot,
+          previouslyActiveJobsClosed: inactiveCount,
           durationMs: scrapeResult.durationMs,
         });
         allJobs.push(...scrapeResult.jobs);
@@ -470,7 +719,9 @@ async function startServer() {
       let dbSyncResult = { inserted: 0, updated: 0, total: 0 };
       if (persistToDb && allJobs.length > 0) {
         const jobsToPersist = allJobs.map((j) => ({
-          source: j.source as any,
+          source: j.source === 'greenhouse' || j.source === 'lever' ? j.source : 'custom',
+          atsProvider: j.source,
+          dataOrigin: 'live' as const,
           externalId: j.externalId,
           company: j.company,
           title: j.jobTitle,
@@ -486,10 +737,15 @@ async function startServer() {
         dbSyncResult = db.upsertJobs(jobsToPersist);
       }
 
-      res.json({
-        success: true,
+      const failedCount = results.filter((result) => result.status === 'FAILED' || result.status === 'PARTIAL').length;
+      const unsupportedCount = results.filter((result) => result.status === 'UNSUPPORTED').length;
+      res.status(failedCount > 0 || unsupportedCount > 0 ? 207 : 200).json({
+        success: failedCount === 0 && unsupportedCount === 0,
+        status: failedCount > 0 ? 'PARTIAL_FAILURE' : unsupportedCount > 0 ? 'PARTIAL_UNSUPPORTED' : 'SUCCESS',
         companiesScraped: results.length,
         totalJobsFetched: allJobs.length,
+        failedCount,
+        unsupportedCount,
         dbSync: dbSyncResult,
         companyResults: results,
       });
@@ -501,17 +757,36 @@ async function startServer() {
 
   // 3. Supported ATS Boards Metadata List
   app.get('/api/scrapers/supported-boards', (req, res) => {
+    const healthById = new Map(liveScraperEngine.getBoardHealth().map((board) => [board.companyId, board]));
+    const supportedBoards = TARGET_COMPANIES_CATALOG.map((company) => ({
+      companyId: company.id,
+      company: company.name,
+      provider: company.atsProvider,
+      boardToken: company.boardToken,
+      careersUrl: company.careersUrl,
+      connectorStatus: liveScraperEngine.hasConfiguredConnector(company) ? 'supported_unverified' : 'unsupported',
+      verificationStatus: healthById.get(company.id)?.verificationStatus ?? 'not_checked',
+      isRealtimeEnabled: liveScraperEngine.isBoardVerified(company.id),
+      sampleRoles: company.sampleRoles,
+    }));
+    const verifiedBoardCount = supportedBoards.filter((board) =>
+      board.verificationStatus === 'healthy' || board.verificationStatus === 'empty'
+    ).length;
     res.json({
-      supportedBoards: TARGET_COMPANIES_CATALOG.slice(0, 20).map((c) => ({
-        company: c.name,
-        source: c.atsProvider,
-        boardToken: c.boardToken,
-        industry: c.category,
-        sampleRoles: c.sampleRoles,
-        typicalHiringBar: c.typicalHiringBar,
-      })),
+      supportedBoards,
       totalConfigured: TARGET_COMPANIES_CATALOG.length,
-      adapters: ['GreenhouseScraper', 'LeverScraper', 'AshbyScraper', 'WorkdayScraper', 'CustomRestConnector'],
+      configuredConnectorCount: supportedBoards.filter((board) => board.connectorStatus === 'supported_unverified').length,
+      verifiedBoardCount,
+      adapters: ['GreenhouseScraper', 'LeverScraper', 'AshbyScraper', 'WorkdayScraper'],
+      termsReviewStatus: process.env.ATS_TERMS_REVIEWED === 'true' ? 'approved_by_operator' : 'not_reviewed',
+      note: 'Connector support means an adapter exists; individual boards are unverified until a successful live fetch. Sample roles are not job listings. Terms status is an operator attestation, not a legal determination.',
+    });
+  });
+
+  app.get('/api/scrapers/health', (req, res) => {
+    res.json({
+      freshnessWindowHours: 72,
+      boards: liveScraperEngine.getBoardHealth(),
     });
   });
 
@@ -519,6 +794,9 @@ async function startServer() {
   app.post('/api/scrapers/greenhouse', scraperRateLimiter, async (req, res) => {
     try {
       const { boardToken, company, rawPayload, persistToDb = true } = req.body;
+      if (!rawPayload && !isLiveScrapingEnabled()) {
+        return res.status(503).json({ error: 'Live job ingestion is disabled pending source-specific terms review.' });
+      }
 
       if (!boardToken && !rawPayload) {
         return res.status(400).json({ error: 'boardToken or rawPayload is required.' });
@@ -536,7 +814,9 @@ async function startServer() {
       let dbSyncResult = { inserted: 0, updated: 0, total: 0 };
       if (persistToDb && normalizedJobs.length > 0) {
         const jobsToPersist = normalizedJobs.map((j) => ({
-          source: j.source as 'greenhouse' | 'lever',
+          source: 'greenhouse' as const,
+          atsProvider: 'greenhouse',
+          dataOrigin: rawPayload ? 'manual' as const : 'live' as const,
           externalId: j.externalId,
           company: j.company,
           title: j.jobTitle,
@@ -570,6 +850,9 @@ async function startServer() {
   app.post('/api/scrapers/lever', scraperRateLimiter, async (req, res) => {
     try {
       const { companySite, company, rawPayload, persistToDb = true } = req.body;
+      if (!rawPayload && !isLiveScrapingEnabled()) {
+        return res.status(503).json({ error: 'Live job ingestion is disabled pending source-specific terms review.' });
+      }
 
       if (!companySite && !rawPayload) {
         return res.status(400).json({ error: 'companySite or rawPayload is required.' });
@@ -587,7 +870,9 @@ async function startServer() {
       let dbSyncResult = { inserted: 0, updated: 0, total: 0 };
       if (persistToDb && normalizedJobs.length > 0) {
         const jobsToPersist = normalizedJobs.map((j) => ({
-          source: j.source as 'greenhouse' | 'lever',
+          source: 'lever' as const,
+          atsProvider: 'lever',
+          dataOrigin: rawPayload ? 'manual' as const : 'live' as const,
           externalId: j.externalId,
           company: j.company,
           title: j.jobTitle,
@@ -620,49 +905,61 @@ async function startServer() {
   // 4. Batch Scrape All Target Boards
   app.post('/api/scrapers/run-all', async (req, res) => {
     try {
-      const targets = [
-        { type: 'greenhouse', token: 'stripe', company: 'Stripe' },
-        { type: 'greenhouse', token: 'figma', company: 'Figma' },
-        { type: 'greenhouse', token: 'databricks', company: 'Databricks' },
-        { type: 'lever', token: 'palantir', company: 'Palantir' },
-        { type: 'lever', token: 'openai', company: 'OpenAI' },
-      ];
-
+      if (!isLiveScrapingEnabled()) {
+        return res.status(503).json({ error: 'Live job ingestion is disabled pending source-specific terms review.' });
+      }
+      const targets = TARGET_COMPANIES_CATALOG
+        .filter((company) => liveScraperEngine.hasConfiguredConnector(company))
+        .slice(0, 5);
+      const results = [];
       const allJobs = [];
 
-      for (const target of targets) {
-        if (target.type === 'greenhouse') {
-          const jobs = await greenhouseScraper.fetchBoard(target.token, target.company);
-          allJobs.push(...jobs);
-        } else {
-          const jobs = await leverScraper.fetchBoard(target.token, target.company);
-          allJobs.push(...jobs);
+      for (const company of targets) {
+        const result = await liveScraperEngine.scrapeCompany(company);
+        results.push({
+          companyId: company.id,
+          company: company.name,
+          provider: company.atsProvider,
+          status: result.status,
+          error: result.error,
+          totalFetched: result.totalFetched,
+          rejectedJobCount: result.rejectedJobCount,
+        });
+        if (result.completeSnapshot && (result.status === 'SUCCESS' || result.status === 'EMPTY')) {
+          db.deactivateMissingBoardJobs(
+            company.name,
+            result.provider === 'greenhouse' || result.provider === 'lever' ? result.provider : 'custom',
+            result.jobs.map((job) => job.externalId)
+          );
         }
+        allJobs.push(...result.jobs);
       }
 
-      const jobsToPersist = allJobs.map((j) => ({
-        source: j.source as 'greenhouse' | 'lever',
-        externalId: j.externalId,
-        company: j.company,
-        title: j.jobTitle,
-        location: j.location,
-        isRemote: j.isRemote,
-        description: j.cleanDescription,
-        rawJd: j.rawDescription,
-        statedRequirements: j.statedRequirements,
-        informalBar: j.informalBar,
-        applyUrl: j.directApplyUrl,
-        postedAt: j.postedAt,
+      const jobsToPersist = allJobs.map((job) => ({
+        source: job.source === 'greenhouse' || job.source === 'lever' ? job.source : 'custom',
+        atsProvider: job.source,
+        dataOrigin: 'live' as const,
+        externalId: job.externalId,
+        company: job.company,
+        title: job.jobTitle,
+        location: job.location,
+        isRemote: job.isRemote,
+        description: job.cleanDescription,
+        rawJd: job.rawDescription,
+        statedRequirements: job.statedRequirements,
+        informalBar: job.informalBar,
+        applyUrl: job.directApplyUrl,
+        postedAt: job.postedAt,
       }));
-
       const dbSync = db.upsertJobs(jobsToPersist);
-
-      res.json({
-        success: true,
+      const failedCount = results.filter((result) => result.status === 'FAILED' || result.status === 'PARTIAL').length;
+      res.status(failedCount > 0 ? 207 : 200).json({
+        success: failedCount === 0,
         totalIngested: allJobs.length,
         targetsProcessed: targets.length,
+        failedCount,
         dbSync,
-        jobs: allJobs,
+        companyResults: results,
       });
     } catch (err: any) {
       res.status(500).json({ error: 'Batch Ingestion Error', message: err.message });
@@ -816,94 +1113,58 @@ async function startServer() {
     res.json(stats);
   });
 
-  // 3. Raw SQL DDL Migration & Drizzle Schema String Exporter
-  app.get('/api/db/schema', (req, res) => {
-    try {
-      const sqlPath = path.join(process.cwd(), 'src', 'db', 'migrations', '0000_initial_schema.sql');
-      const seedPath = path.join(process.cwd(), 'src', 'db', 'migrations', '0001_seed_data.sql');
-      const drizzlePath = path.join(process.cwd(), 'src', 'db', 'schema.ts');
+  if (process.env.NODE_ENV !== 'production') {
+    app.get('/api/db/schema', (req, res) => {
+      try {
+        const sqlPath = path.join(process.cwd(), 'src', 'db', 'migrations', '0000_initial_schema.sql');
+        const drizzlePath = path.join(process.cwd(), 'src', 'db', 'schema.ts');
+        const sqlSchema = fs.existsSync(sqlPath) ? fs.readFileSync(sqlPath, 'utf-8') : '-- SQL File Not Found';
+        const drizzleCode = fs.existsSync(drizzlePath) ? fs.readFileSync(drizzlePath, 'utf-8') : '// Drizzle file not found';
+        res.json({ sqlSchema, drizzleCode });
+      } catch (err: any) {
+        res.status(500).json({ error: err.message });
+      }
+    });
 
-      const sqlSchema = fs.existsSync(sqlPath) ? fs.readFileSync(sqlPath, 'utf-8') : '-- SQL File Not Found';
-      const sqlSeed = fs.existsSync(seedPath) ? fs.readFileSync(seedPath, 'utf-8') : '-- Seed SQL File Not Found';
-      const drizzleCode = fs.existsSync(drizzlePath) ? fs.readFileSync(drizzlePath, 'utf-8') : '// Drizzle file not found';
-
-      res.json({
-        sqlSchema,
-        sqlSeed,
-        drizzleCode,
-      });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // 4. Run Migration
-  app.post('/api/db/migrate', (req, res) => {
-    const status = db.runMigrationSim();
-    res.json({ success: true, message: status, stats: db.getStats() });
-  });
-
-  // 5. Seed Database
-  app.post('/api/db/seed', (req, res) => {
-    db.seedDefaults();
-    res.json({ success: true, message: 'Database reset and seeded successfully!', stats: db.getStats() });
-  });
+    app.post('/api/db/seed', (req, res) => {
+      db.seedDefaults();
+      res.json({ success: true, message: 'Development database reset and seeded.', stats: db.getStats() });
+    });
+  }
 
   // 6. Users Endpoints (Multi-Tenant)
   app.get('/api/users', (req, res) => {
-    const tenantId = req.query.tenantId as string | undefined;
-    const users = db.getUsers(tenantId);
-    res.json(users);
+    const user = db.getUserById((req as AuthenticatedRequest).user!.userId, (req as AuthenticatedRequest).user!.tenantId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const { passwordHash, ...safeUser } = user;
+    res.json([safeUser]);
   });
 
   app.post('/api/users', (req, res) => {
-    const { tenantId, email, fullName, avatarUrl } = req.body;
-    if (!tenantId || !email || !fullName) {
-      return res.status(400).json({ error: 'tenantId, email, and fullName are required.' });
-    }
-    const user = db.createUser({ tenantId, email, fullName, avatarUrl });
-    res.status(201).json(user);
+    res.status(404).json({ error: 'Use /api/auth/register to create an account.' });
   });
 
   app.delete('/api/users/:id', (req, res) => {
-    const tenantId = req.query.tenantId as string | undefined;
-    const success = db.deleteUser(req.params.id, tenantId);
-    if (!success) return res.status(404).json({ error: 'User not found or tenant mismatch' });
-    res.json({ success: true, id: req.params.id });
-  });
-
-  // 7. Resumes Endpoints
-  app.get('/api/resumes', (req, res) => {
-    const tenantId = req.query.tenantId as string | undefined;
-    const userId = req.query.userId as string | undefined;
-    const resumes = db.getResumes(tenantId, userId);
-    res.json(resumes);
-  });
-
-  app.post('/api/resumes', (req, res) => {
-    const { userId, tenantId, title, content, extractedSkills, parsedExperience, isPrimary } = req.body;
-    if (!userId || !tenantId || !title || !content) {
-      return res.status(400).json({ error: 'userId, tenantId, title, and content are required.' });
+    const authenticatedRequest = req as AuthenticatedRequest;
+    const identity = authenticatedRequest.user;
+    if (!identity || req.params.id !== identity.userId) {
+      return res.status(403).json({ error: 'You may only delete your own account.' });
     }
-    const resume = db.createResume({
-      userId,
-      tenantId,
-      title,
-      content,
-      extractedSkills: extractedSkills || [],
-      parsedExperience: parsedExperience || [],
-      isPrimary: isPrimary ?? true,
-    });
-    res.status(201).json(resume);
+    const resumesToDelete = db.getResumes(identity.tenantId, identity.userId);
+    if (!db.deleteUser(identity.userId, identity.tenantId)) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    notificationDispatcher.clearHistoryForCandidate(identity.userId);
+    resumesToDelete.forEach((resume) => dynamicResumeEngine.deleteResumeData(resume.id));
+    userFeedbackStore.deleteCandidate(identity.userId);
+    return res.json({ success: true, id: identity.userId });
   });
 
   // 8. User Preferences Endpoints (Strict storage: target locations, target roles, preferred/blacklisted companies, match threshold)
   app.get('/api/preferences', (req, res) => {
-    const userId = req.query.userId as string;
-    const tenantId = req.query.tenantId as string | undefined;
-    if (!userId) {
-      return res.status(400).json({ error: 'userId query parameter is required.' });
-    }
+    const authenticatedRequest = req as AuthenticatedRequest;
+    const userId = authenticatedRequest.user!.userId;
+    const tenantId = authenticatedRequest.user!.tenantId;
     const pref = db.getPreferences(userId, tenantId);
     if (!pref) {
       return res.status(404).json({ error: 'Preferences not found for user' });
@@ -912,28 +1173,22 @@ async function startServer() {
   });
 
   app.put('/api/preferences', (req, res) => {
-    const { userId, tenantId, targetLocations, targetRoles, preferredCompanies, blacklistedCompanies, customMatchThreshold, alertMethod, alertDestination, isActive } = req.body;
-    if (!userId || !tenantId) {
-      return res.status(400).json({ error: 'userId and tenantId are required.' });
+    const authenticatedRequest = req as AuthenticatedRequest;
+    const parseResult = preferencesSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return res.status(400).json({ error: 'Validation Error', details: parseResult.error.flatten().fieldErrors });
     }
     const updated = db.upsertPreferences({
-      userId,
-      tenantId,
-      targetLocations,
-      targetRoles,
-      preferredCompanies,
-      blacklistedCompanies,
-      customMatchThreshold: customMatchThreshold !== undefined ? Number(customMatchThreshold) : undefined,
-      alertMethod,
-      alertDestination,
-      isActive,
+      userId: authenticatedRequest.user!.userId,
+      tenantId: authenticatedRequest.user!.tenantId,
+      ...parseResult.data,
     });
     res.json(updated);
   });
 
   // 9. Jobs Endpoints
   app.get('/api/jobs', (req, res) => {
-    const jobs = db.getJobs();
+    const jobs = db.getJobs().filter((job) => job.isActive);
     res.json(jobs);
   });
 
@@ -944,6 +1199,8 @@ async function startServer() {
     }
     const job = db.createJob({
       source: source || 'greenhouse',
+      atsProvider: source || 'greenhouse',
+      dataOrigin: 'manual',
       externalId: externalId || `ext-${Date.now()}`,
       company,
       title,
@@ -1094,12 +1351,12 @@ async function startServer() {
 
       let resume: any = customResume;
       if (!resume && resumeId) {
-        resume = db.getResumes().find((r) => r.id === resumeId);
+        resume = getAuthenticatedResumes(req).find((r) => r.id === resumeId);
       }
       if (!resume) {
         // Fallback to first primary resume in system
-        const allResumes = db.getResumes();
-        resume = allResumes.find((r) => r.isPrimary) || allResumes[0];
+        const ownResumes = getAuthenticatedResumes(req);
+        resume = ownResumes.find((r) => r.isPrimary) || ownResumes[0];
       }
 
       let job: any = customJob;
@@ -1124,12 +1381,11 @@ async function startServer() {
 
   app.post('/api/rag/layer1/batch-evaluate', ragRateLimiter, (req, res) => {
     try {
-      const { resumeId, userId, tenantId, weights } = req.body;
-      let resume = db.getResumes(tenantId, userId).find((r) => r.id === resumeId || r.isPrimary);
-      if (!resume) {
-        const all = db.getResumes();
-        resume = all[0];
-      }
+      const { resumeId, weights } = req.body;
+      const ownResumes = getAuthenticatedResumes(req);
+      const resume = resumeId
+        ? ownResumes.find((r) => r.id === resumeId)
+        : ownResumes.find((r) => r.isPrimary) || ownResumes[0];
 
       if (!resume) {
         return res.status(404).json({ error: 'No resume found for candidate' });
@@ -1256,11 +1512,11 @@ async function startServer() {
 
       let resume: any = customResume;
       if (!resume && resumeId) {
-        resume = db.getResumes().find((r) => r.id === resumeId);
+        resume = getAuthenticatedResumes(req).find((r) => r.id === resumeId);
       }
       if (!resume) {
-        const allResumes = db.getResumes();
-        resume = allResumes.find((r) => r.isPrimary) || allResumes[0];
+        const ownResumes = getAuthenticatedResumes(req);
+        resume = ownResumes.find((r) => r.isPrimary) || ownResumes[0];
       }
 
       let job: any = customJob;
@@ -1289,12 +1545,11 @@ async function startServer() {
   // 2. Batch Layer 2 Reality Evaluation Across All Active Jobs
   app.post('/api/rag/layer2/batch-evaluate', ragRateLimiter, (req, res) => {
     try {
-      const { resumeId, userId, tenantId, filterWarningsOnly, minRealityScore } = req.body;
-      let resume = db.getResumes(tenantId, userId).find((r) => r.id === resumeId || r.isPrimary);
-      if (!resume) {
-        const all = db.getResumes();
-        resume = all[0];
-      }
+      const { resumeId, filterWarningsOnly, minRealityScore } = req.body;
+      const ownResumes = getAuthenticatedResumes(req);
+      const resume = resumeId
+        ? ownResumes.find((r) => r.id === resumeId)
+        : ownResumes.find((r) => r.isPrimary) || ownResumes[0];
 
       if (!resume) {
         return res.status(404).json({ error: 'No candidate resume found for Layer 2 evaluation' });
@@ -1405,10 +1660,10 @@ async function startServer() {
 
       let reasoningSummary = null;
       if (synthesizeLlm) {
-        let resume = resumeId ? db.getResumes().find((r) => r.id === resumeId) : null;
+        let resume = resumeId ? getAuthenticatedResumes(req).find((r) => r.id === resumeId) : null;
         if (!resume) {
-          const allResumes = db.getResumes();
-          resume = allResumes.find((r) => r.isPrimary) || allResumes[0];
+          const ownResumes = getAuthenticatedResumes(req);
+          resume = ownResumes.find((r) => r.isPrimary) || ownResumes[0];
         }
 
         const dummyJob: any = {
@@ -1566,11 +1821,11 @@ async function startServer() {
 
       let resume: any = customResume;
       if (!resume && resumeId) {
-        resume = db.getResumes().find((r) => r.id === resumeId);
+        resume = getAuthenticatedResumes(req).find((r) => r.id === resumeId);
       }
       if (!resume) {
-        const allResumes = db.getResumes();
-        resume = allResumes.find((r) => r.isPrimary) || allResumes[0];
+        const ownResumes = getAuthenticatedResumes(req);
+        resume = ownResumes.find((r) => r.isPrimary) || ownResumes[0];
       }
 
       let job: any = customJob;
@@ -1587,11 +1842,9 @@ async function startServer() {
       }
 
       let preferences = customPreferences;
-      if (!preferences && resume.userId) {
-        preferences = db.getPreferences(resume.tenantId, resume.userId);
-      }
       if (!preferences) {
-        preferences = db.getPreferences()[0];
+        const identity = (req as AuthenticatedRequest).user!;
+        preferences = db.getPreferences(identity.userId, identity.tenantId);
       }
 
       const evaluation = compositeScoringEngine.evaluateCompositeMatch(
@@ -1617,8 +1870,6 @@ async function startServer() {
     try {
       const {
         resumeId,
-        userId,
-        tenantId,
         customPreferences,
         weights,
         strictLocationDisqualifier,
@@ -1628,22 +1879,19 @@ async function startServer() {
         filterNonDisqualifiedOnly,
       } = req.body;
 
-      let resume = db.getResumes(tenantId, userId).find((r) => r.id === resumeId || r.isPrimary);
-      if (!resume) {
-        const all = db.getResumes();
-        resume = all[0];
-      }
+      const ownResumes = getAuthenticatedResumes(req);
+      const resume = resumeId
+        ? ownResumes.find((r) => r.id === resumeId)
+        : ownResumes.find((r) => r.isPrimary) || ownResumes[0];
 
       if (!resume) {
         return res.status(404).json({ error: 'No candidate resume available for batch scoring' });
       }
 
       let preferences = customPreferences;
-      if (!preferences && (userId || resume.userId)) {
-        preferences = db.getPreferences(tenantId || resume.tenantId, userId || resume.userId);
-      }
       if (!preferences) {
-        preferences = db.getPreferences()[0];
+        const identity = (req as AuthenticatedRequest).user!;
+        preferences = db.getPreferences(identity.userId, identity.tenantId);
       }
 
       const allJobs = db.getJobs(); // Evaluates all jobs (active & inactive) so hard disqualifier can be audited
@@ -1923,17 +2171,15 @@ async function startServer() {
 
   // 10. Matches Endpoints
   app.get('/api/matches', (req, res) => {
-    const tenantId = req.query.tenantId as string | undefined;
-    const userId = req.query.userId as string | undefined;
-    const matches = db.getMatches(tenantId, userId);
+    const authenticatedRequest = req as AuthenticatedRequest;
+    const matches = db.getMatches(authenticatedRequest.user!.tenantId, authenticatedRequest.user!.userId);
     res.json(matches);
   });
 
   // 11. Notifications Endpoints
   app.get('/api/notifications', (req, res) => {
-    const tenantId = req.query.tenantId as string | undefined;
-    const userId = req.query.userId as string | undefined;
-    const notifs = db.getNotifications(tenantId, userId);
+    const authenticatedRequest = req as AuthenticatedRequest;
+    const notifs = db.getNotifications(authenticatedRequest.user!.tenantId, authenticatedRequest.user!.userId);
     res.json(notifs);
   });
 
@@ -1962,13 +2208,23 @@ async function startServer() {
   // ==========================================
 
   // 1. Get Alerting Engine Configurations
-  app.get('/api/alerts/config', generalRateLimiter, (req, res) => {
-    try {
-      res.json({
-        telegram: telegramAlertService.getConfig(),
-        email: emailAlertService.getConfig(),
+  const getPublicAlertConfiguration = () => {
+      const telegram = telegramAlertService.getConfig();
+      const email = emailAlertService.getConfig();
+      return {
+        email: { ...email, apiKey: '', toEmail: '' },
+        telegram: { ...telegram, botToken: '', chatId: '' },
+        credentialsConfigured: {
+          telegram: Boolean(telegram.botToken && !/demo|sandbox/i.test(telegram.botToken)),
+          email: Boolean(email.apiKey && !/demo|sandbox/i.test(email.apiKey)),
+        },
         rules: notificationDispatcher.getRules(),
-      });
+      };
+  };
+
+  app.get('/api/alerts/config', generalRateLimiter, (_req, res) => {
+    try {
+      res.json(getPublicAlertConfiguration());
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to fetch alert configuration' });
     }
@@ -1977,17 +2233,33 @@ async function startServer() {
   // 2. Update Alerting Engine Configurations
   app.post('/api/alerts/config', generalRateLimiter, (req, res) => {
     try {
-      const { telegram, email, rules } = req.body;
-      if (telegram) telegramAlertService.updateConfig(telegram);
-      if (email) emailAlertService.updateConfig(email);
+      const parsedConfiguration = alertConfigurationSchema.safeParse(req.body);
+      if (!parsedConfiguration.success) {
+        return res.status(400).json({
+          error: 'Validation Error',
+          details: parsedConfiguration.error.flatten().fieldErrors,
+        });
+      }
+      const { telegram, email, rules } = parsedConfiguration.data;
+      if (telegram) {
+        telegramAlertService.updateConfig({
+          ...telegram,
+          botToken: telegram.botToken || telegramAlertService.getConfig().botToken,
+        });
+      }
+      if (email) {
+        emailAlertService.updateConfig({
+          ...email,
+          apiKey: email.apiKey || emailAlertService.getConfig().apiKey,
+          toEmail: email.toEmail || emailAlertService.getConfig().toEmail,
+        });
+      }
       if (rules) notificationDispatcher.updateRules(rules);
 
       res.json({
         success: true,
         message: 'Alert configuration updated successfully',
-        telegram: telegramAlertService.getConfig(),
-        email: emailAlertService.getConfig(),
-        rules: notificationDispatcher.getRules(),
+        configuration: getPublicAlertConfiguration(),
       });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to update alert configuration' });
@@ -1998,7 +2270,10 @@ async function startServer() {
   app.get('/api/alerts/history', generalRateLimiter, (req, res) => {
     try {
       const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
-      const history = notificationDispatcher.getHistory(limit);
+      const history = notificationDispatcher.getHistoryForCandidate(
+        (req as AuthenticatedRequest).user!.userId,
+        limit
+      );
       res.json(history);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to fetch alert history' });
@@ -2008,7 +2283,7 @@ async function startServer() {
   // 4. Clear Alert History
   app.delete('/api/alerts/history', generalRateLimiter, (req, res) => {
     try {
-      notificationDispatcher.clearHistory();
+      notificationDispatcher.clearHistoryForCandidate((req as AuthenticatedRequest).user!.userId);
       res.json({ success: true, message: 'Alert history cleared' });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to clear alert history' });
@@ -2043,14 +2318,14 @@ async function startServer() {
   // 7. Dispatch Test Alert (Manual / Simulator)
   app.post('/api/alerts/dispatch-test', generalRateLimiter, async (req, res) => {
     try {
-      const { payload, candidateId, forceSimulated, bypassThreshold } = req.body;
+      const { payload, forceSimulated, bypassThreshold } = req.body;
       if (!payload || !payload.companyName || !payload.jobTitle) {
         return res.status(400).json({ error: 'Valid notification payload is required' });
       }
 
       const record = await notificationDispatcher.dispatchPayload(
         payload,
-        candidateId || 'candidate-default-01',
+        (req as AuthenticatedRequest).user!.userId,
         { forceSimulated: Boolean(forceSimulated), bypassThreshold: Boolean(bypassThreshold) }
       );
 
@@ -2070,7 +2345,13 @@ async function startServer() {
 
       const record = await notificationDispatcher.evaluateAndDispatch(
         evaluation,
-        candidateInfo,
+        {
+          ...candidateInfo,
+          id: (req as AuthenticatedRequest).user!.userId,
+          candidateId: (req as AuthenticatedRequest).user!.userId,
+          name: (req as AuthenticatedRequest).user!.fullName,
+          email: (req as AuthenticatedRequest).user!.email,
+        },
         { forceSimulated: Boolean(forceSimulated), bypassThreshold: Boolean(bypassThreshold) }
       );
 
@@ -2088,7 +2369,10 @@ async function startServer() {
   // 9. Retry Specific Alert
   app.post('/api/alerts/retry/:id', generalRateLimiter, async (req, res) => {
     try {
-      const record = await notificationDispatcher.retryDispatch(req.params.id);
+      const record = await notificationDispatcher.retryDispatch(
+        req.params.id,
+        (req as AuthenticatedRequest).user!.userId
+      );
       if (!record) {
         return res.status(404).json({ error: 'Historical alert record not found' });
       }
@@ -2146,12 +2430,15 @@ async function startServer() {
   // 1. Submit User Feedback (Applied, Skipped, Irrelevant, Saved)
   app.post('/api/feedback/record', generalRateLimiter, (req, res) => {
     try {
-      const { jobId, action } = req.body;
-      if (!jobId || !action) {
-        return res.status(400).json({ error: 'jobId and action are required' });
+      const parsedFeedback = feedbackRecordSchema.safeParse(req.body);
+      if (!parsedFeedback.success) {
+        return res.status(400).json({ error: 'Validation Error', details: parsedFeedback.error.flatten().fieldErrors });
       }
 
-      const response = adaptiveThresholdTuner.processFeedback(req.body);
+      const response = adaptiveThresholdTuner.processFeedback({
+        ...parsedFeedback.data,
+        candidateId: (req as AuthenticatedRequest).user!.userId,
+      });
       res.status(201).json(response);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to process user feedback' });
@@ -2161,10 +2448,15 @@ async function startServer() {
   // 2. 1-Click Interactive Webhook Handler for Email Links & Direct URLs
   app.get('/api/feedback/action', generalRateLimiter, (req, res) => {
     try {
-      const jobId = (req.query.jobId as string) || 'job-unknown';
-      const action = ((req.query.action as string) || 'APPLIED').toUpperCase() as any;
-      const candidateId = (req.query.candidateId as string) || 'alex-rivera-stanford';
-      const score = req.query.score ? parseFloat(req.query.score as string) : 0.85;
+      const parsedJobId = requestIdSchema.safeParse(req.query.jobId);
+      const parsedAction = feedbackActionSchema.safeParse(String(req.query.action || 'APPLIED').toUpperCase());
+      const score = req.query.score === undefined ? 0.85 : Number(req.query.score);
+      if (!parsedJobId.success || !parsedAction.success || !Number.isFinite(score) || score < 0 || score > 1) {
+        return res.status(400).json({ error: 'Validation Error', message: 'Valid jobId, action, and match score are required.' });
+      }
+      const jobId = parsedJobId.data;
+      const action = parsedAction.data;
+      const candidateId = (req as AuthenticatedRequest).user!.userId;
       const company = (req.query.company as string) || 'Target Company';
 
       const response = adaptiveThresholdTuner.processFeedback({
@@ -2232,17 +2524,38 @@ async function startServer() {
   });
 
   // 3. Telegram Webhook Callback Handler (for inline keyboard clicks)
-  app.post('/api/feedback/telegram-webhook', generalRateLimiter, (req, res) => {
+  app.post('/api/feedback/telegram-webhook', generalRateLimiter, (req, res, next) => {
+    const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+    const suppliedSecret = req.get('X-Telegram-Bot-Api-Secret-Token');
+    if (!webhookSecret) {
+      return res.status(503).json({ error: 'Telegram webhook is not configured.' });
+    }
+    const expectedBytes = Buffer.from(webhookSecret);
+    const suppliedBytes = Buffer.from(suppliedSecret || '');
+    if (expectedBytes.length !== suppliedBytes.length || !timingSafeEqual(expectedBytes, suppliedBytes)) {
+      return res.status(401).json({ error: 'Invalid webhook secret.' });
+    }
+    return next();
+  }, (req, res) => {
     try {
       const callbackQuery = req.body.callback_query;
       if (callbackQuery && callbackQuery.data) {
         // e.g. "ACTION:APPLIED:job-01:cand-01:0.92"
         const parts = callbackQuery.data.split(':');
         if (parts[0] === 'ACTION' && parts[1]) {
-          const action = parts[1] as any;
-          const jobId = parts[2] || 'job-tg-01';
-          const candidateId = parts[3] || 'alex-rivera-stanford';
-          const matchScore = parts[4] ? parseFloat(parts[4]) : 0.85;
+          const parsedAction = feedbackActionSchema.safeParse(parts[1]);
+          const parsedJobId = requestIdSchema.safeParse(parts[2]);
+          if (!parsedAction.success || !parsedJobId.success) {
+            return res.status(400).json({ error: 'Invalid feedback callback action or job ID.' });
+          }
+          const action = parsedAction.data;
+          const jobId = parsedJobId.data;
+          const parsedCandidateId = requestIdSchema.safeParse(parts[3]);
+          const matchScore = parts[4] ? Number(parts[4]) : 0.85;
+          if (!parsedCandidateId.success || !Number.isFinite(matchScore) || matchScore < 0 || matchScore > 1) {
+            return res.status(400).json({ error: 'Invalid candidate ID or match score in feedback callback.' });
+          }
+          const candidateId = parsedCandidateId.data;
 
           const response = adaptiveThresholdTuner.processFeedback({
             candidateId,
@@ -2281,10 +2594,8 @@ async function startServer() {
   app.get('/api/feedback/history', generalRateLimiter, (req, res) => {
     try {
       const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
-      const candidateId = req.query.candidateId as string;
-      const history = candidateId
-        ? userFeedbackStore.getFeedbackByCandidate(candidateId, limit)
-        : userFeedbackStore.getAllFeedback(limit);
+      const candidateId = (req as AuthenticatedRequest).user!.userId;
+      const history = userFeedbackStore.getFeedbackByCandidate(candidateId, limit);
 
       res.json(history);
     } catch (err: any) {
@@ -2332,8 +2643,10 @@ async function startServer() {
   // 1. Single Skill Delta Patch
   app.post('/api/resume/delta/skill', generalRateLimiter, (req, res) => {
     try {
-      const { resumeId = 'res-11111111-1111-4111-a111-111111111111', skill, action = 'ADD' } = req.body;
-      if (!skill || typeof skill !== 'string') {
+      const { skill, action = 'ADD' } = req.body;
+      const resumeId = requireOwnedResume(req, res, req.body.resumeId);
+      if (!resumeId) return;
+      if (typeof skill !== 'string' || !skill.trim() || skill.length > 100 || !['ADD', 'REMOVE'].includes(action)) {
         return res.status(400).json({ error: 'skill name string is required' });
       }
 
@@ -2347,8 +2660,10 @@ async function startServer() {
   // 2. Incremental Project Addition Patch
   app.post('/api/resume/delta/project', generalRateLimiter, (req, res) => {
     try {
-      const { resumeId = 'res-11111111-1111-4111-a111-111111111111', project } = req.body;
-      if (!project || !project.title) {
+      const { project } = req.body;
+      const resumeId = requireOwnedResume(req, res, req.body.resumeId);
+      if (!resumeId) return;
+      if (!project || typeof project.title !== 'string' || !project.title.trim()) {
         return res.status(400).json({ error: 'project title and details are required' });
       }
 
@@ -2368,15 +2683,18 @@ async function startServer() {
   // 3. Modular Experience Sub-Vector Patch
   app.post('/api/resume/delta/experience', generalRateLimiter, (req, res) => {
     try {
-      const { resumeId = 'res-11111111-1111-4111-a111-111111111111', experience } = req.body;
-      if (!experience || !experience.company || !experience.role) {
+      const { experience } = req.body;
+      const resumeId = requireOwnedResume(req, res, req.body.resumeId);
+      if (!resumeId) return;
+      if (!experience || typeof experience.company !== 'string' || !experience.company.trim() ||
+          typeof experience.role !== 'string' || !experience.role.trim()) {
         return res.status(400).json({ error: 'company and role are required for experience delta' });
       }
 
       const result = dynamicResumeEngine.patchExperienceDelta(resumeId, {
         company: experience.company,
         role: experience.role,
-        duration: experience.duration || '2026',
+        duration: typeof experience.duration === 'string' ? experience.duration : '',
         highlights: Array.isArray(experience.highlights) ? experience.highlights : [],
         technologies: Array.isArray(experience.technologies) ? experience.technologies : [],
       });
@@ -2389,7 +2707,9 @@ async function startServer() {
   // 4. Generalized Delta Patch Endpoint
   app.post('/api/resume/delta/patch', generalRateLimiter, (req, res) => {
     try {
-      const { resumeId = 'res-11111111-1111-4111-a111-111111111111', deltaType, skill, project, experience } = req.body;
+      const { deltaType, skill, project, experience } = req.body;
+      const resumeId = requireOwnedResume(req, res, req.body.resumeId);
+      if (!resumeId) return;
       const result = dynamicResumeEngine.executeDeltaPatch({
         resumeId,
         deltaType,
@@ -2406,7 +2726,8 @@ async function startServer() {
   // 5. Get Modular Profile & Sub-Vectors
   app.get('/api/resume/modular-vectors/:resumeId', generalRateLimiter, (req, res) => {
     try {
-      const resumeId = req.params.resumeId;
+      const resumeId = requireOwnedResume(req, res, req.params.resumeId);
+      if (!resumeId) return;
       const profile = dynamicResumeEngine.getModularProfile(resumeId);
       const projects = dynamicResumeEngine.getResumeProjects(resumeId);
       const experiences = dynamicResumeEngine.getResumeExperiences(resumeId);
@@ -2430,7 +2751,8 @@ async function startServer() {
   // 6. Get Delta Update Audit Trail
   app.get('/api/resume/delta/audit/:resumeId', generalRateLimiter, (req, res) => {
     try {
-      const resumeId = req.params.resumeId;
+      const resumeId = requireOwnedResume(req, res, req.params.resumeId);
+      if (!resumeId) return;
       const logs = dynamicResumeEngine.getAuditLogs(resumeId);
       res.json(logs);
     } catch (err: any) {
@@ -2441,7 +2763,8 @@ async function startServer() {
   // 7. Reset Modular Profile to Baseline
   app.post('/api/resume/delta/reset/:resumeId', generalRateLimiter, (req, res) => {
     try {
-      const resumeId = req.params.resumeId;
+      const resumeId = requireOwnedResume(req, res, req.params.resumeId);
+      if (!resumeId) return;
       const resetProfile = dynamicResumeEngine.resetToBaseline(resumeId);
       res.json({
         success: true,
@@ -2629,260 +2952,160 @@ async function startServer() {
     }
   });
 
-  // 4. Production Unified Dashboard Data Overview
-  app.get('/api/dashboard/overview', generalRateLimiter, (req, res) => {
+  // 4. User-specific Dashboard Data Overview
+  app.get('/api/dashboard/overview', generalRateLimiter, authenticateToken, (req: AuthenticatedRequest, res) => {
     try {
+      if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
+      const user = db.getUserById(req.user.userId, req.user.tenantId);
+      if (!user) return res.status(404).json({ error: 'User not found' });
+
+      const preferences = db.getPreferences(user.id, user.tenantId);
+      if (!preferences) return res.status(404).json({ error: 'User preferences not found' });
+
+      const resumes = db.getResumes(user.tenantId, user.id);
+      const primaryResume = resumes.find((resume) => resume.isPrimary) ??
+        [...resumes].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+      const now = Date.now();
+      const jobTokens = (value: string) => value.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+      const roleTerms = preferences.targetRoles
+        .flatMap((role) => jobTokens(role))
+        .filter((term) => !['intern', 'internship', 'summer', 'position', 'role', 'the', 'and'].includes(term));
+      const userMatches: Array<Omit<import('./src/types').Match, 'id' | 'createdAt' | 'updatedAt'>> = [];
+
+      if (primaryResume) {
+        for (const job of db.getJobs()) {
+          if (!job.isActive || job.relevanceStatus !== 'RELEVANT') continue;
+
+          const locationMatch = matchLocationFilter(job.location, job.isRemote, preferences.targetLocations);
+          if (!locationMatch.matched) continue;
+
+          const jobRoleTerms = jobTokens(`${job.title} ${job.description}`);
+          const roleMatch = roleTerms.length === 0 || roleTerms.some((term) =>
+            jobRoleTerms.some((jobTerm) => jobTerm === term || jobTerm.startsWith(term) || term.startsWith(jobTerm))
+          );
+          if (!roleMatch) continue;
+
+          const score = db.evaluateTwoLayerMatch(primaryResume, job, preferences);
+          if (score.isBlacklisted) continue;
+
+          userMatches.push({
+            userId: user.id,
+            tenantId: user.tenantId,
+            jobId: job.id,
+            resumeId: primaryResume.id,
+            layer1Score: score.layer1Score,
+            layer2Score: score.layer2Score,
+            compositeScore: score.compositeScore,
+            matchedSkills: score.matchedSkills,
+            missingSkills: score.missingSkills,
+            status: score.compositeScore >= preferences.customMatchThreshold * 100 ? 'alerted' : 'pending',
+          });
+        }
+      }
+
+      db.replaceUserMatches(user.id, user.tenantId, userMatches);
+      const savedMatches = db.getMatches(user.tenantId, user.id)
+        .filter((match) => match.job)
+        .sort((a, b) => b.compositeScore - a.compositeScore);
+      const topMatches = savedMatches.map((match) => {
+        const job = match.job!;
+        const postedAt = new Date(job.postedAt).getTime();
+        const daysOpen = Number.isFinite(postedAt)
+          ? Math.max(0, Math.floor((now - postedAt) / (1000 * 60 * 60 * 24)))
+          : 0;
+        const applicationStatus = match.applicationStatus ?? 'NEW_MATCH';
+        const scorePercent = Math.round(match.compositeScore);
+        const skillsForRecommendation = match.missingSkills.length > 0 ? match.missingSkills : match.matchedSkills;
+
+        return {
+          jobId: job.id,
+          title: job.title,
+          company: job.company,
+          companyTier: 'Not classified',
+          location: job.location,
+          locationType: job.isRemote ? 'Remote' as const : 'Onsite' as const,
+          sourceUrl: job.applyUrl,
+          atsProvider: job.atsProvider || job.source,
+          postedAt: job.postedAt,
+          dataOrigin: job.dataOrigin ?? 'live',
+          daysOpen,
+          urgencyLevel: daysOpen <= 1 ? 'CRITICAL_IMMEDIATE' as const : daysOpen <= 3 ? 'HIGH_ROLLING' as const : daysOpen <= 7 ? 'MODERATE' as const : 'STANDARD_CYCLE' as const,
+          scores: {
+            finalScore: match.compositeScore / 100,
+            layer1StatedMatch: match.layer1Score,
+            layer2RealityMatch: match.layer2Score,
+          },
+          keyMatchedSkills: match.matchedSkills,
+          missingCriticalSkills: match.missingSkills,
+          oaDetails: {
+            platform: 'Not specified in job record',
+            dsaDifficulty: job.informalBar.dsaDifficulty,
+            focusAreas: job.informalBar.unstatedPreferences,
+          },
+          matchExplanation: `Two-layer score (${scorePercent}%) calculated from ${primaryResume?.title ?? 'the saved resume'} and this job's stored requirements.`,
+          applicationStatus,
+          tailoringRecommendation: skillsForRecommendation.length > 0
+            ? `${match.missingSkills.length > 0 ? 'Address' : 'Highlight'} ${skillsForRecommendation.join(', ')} for this role.`
+            : 'No skills data is available for a tailored recommendation.',
+        };
+      });
+      const todayStart = new Date();
+      todayStart.setHours(0, 0, 0, 0);
+      const alertsDispatchedToday = db.getNotifications(user.tenantId, user.id).filter((notification) =>
+        notification.status === 'sent' && new Date(notification.sentAt).getTime() >= todayStart.getTime()
+      ).length;
+      const activeApplications = topMatches.filter((match) =>
+        ['APPLIED', 'OA_RECEIVED', 'INTERVIEWING', 'OFFER'].includes(match.applicationStatus)
+      ).length;
+      const averageScore = topMatches.length > 0
+        ? topMatches.reduce((total, match) => total + match.scores.finalScore, 0) / topMatches.length * 100
+        : 0;
+      const trackedCompanies = [...new Set(savedMatches.map((match) => match.job!.company))].map((companyName) => {
+        const companyJobs = savedMatches.filter((match) => match.job!.company === companyName).map((match) => match.job!);
+        const representativeJob = companyJobs[0];
+        return {
+          companyName,
+          tier: 'Not classified',
+          activeJobsCount: companyJobs.length,
+          realityBarSummary: representativeJob.informalBar.barDescription || 'No company-specific evaluation data is available.',
+          fastTrackTip: representativeJob.informalBar.oaPattern || 'No assessment guidance is available in the job record.',
+        };
+      });
       const overviewData = {
         user: {
-          id: 'user-alex-rivera-1',
-          fullName: 'Alex Rivera',
-          email: 'alex.rivera@stanford.edu',
-          tenantId: 'tenant-alex-rivera',
-          isOnboarded: true,
+          id: user.id,
+          fullName: user.fullName,
+          email: user.email,
+          tenantId: user.tenantId,
+          isOnboarded: user.isOnboarded,
         },
-        targetParameters: {
-          id: 'pref-alex-prod',
-          userId: 'user-alex-rivera-1',
-          tenantId: 'tenant-alex-rivera',
-          targetLocations: ['San Francisco, CA', 'New York, NY', 'Seattle, WA', 'Remote'],
-          targetRoles: ['Systems Engineer Intern', 'Quantitative Developer', 'AI / ML Engineer Intern', 'Infrastructure Engineer'],
-          preferredCompanies: ['Citadel Securities', 'Jane Street', 'OpenAI', 'Anthropic', 'Two Sigma', 'Databricks', 'Stripe', 'Hudson River Trading (HRT)'],
-          blacklistedCompanies: ['CryptoGambling Inc', 'SpamCorp'],
-          customMatchThreshold: 0.72,
-          alertMethod: 'telegram' as const,
-          alertDestination: '@alex_rivera_scout_bot',
-          isActive: true,
-          createdAt: '2026-08-20T10:00:00.000Z',
-          updatedAt: new Date().toISOString(),
-        },
+        targetParameters: preferences,
         stats: {
-          totalMatchesFound: 38,
-          highMatchCount: 14,
-          avgMatchScore: 84.6,
-          activeApplications: 8,
-          alertsDispatchedToday: 4,
-          lastScrapeRunAt: new Date(Date.now() - 1000 * 60 * 12).toISOString(),
+          totalMatchesFound: topMatches.length,
+          highMatchCount: topMatches.filter((match) => match.scores.finalScore >= 0.85).length,
+          avgMatchScore: Number(averageScore.toFixed(1)),
+          activeApplications,
+          alertsDispatchedToday,
+          lastScrapeRunAt: null,
         },
-        topMatches: [
-          {
-            jobId: 'match-citadel-quant-sys',
-            title: 'Quantitative Research & C++ Systems Intern 2027',
-            company: 'Citadel Securities',
-            companyTier: 'Tier 1 Quant/HFT',
-            location: 'New York, NY',
-            locationType: 'Hybrid',
-            salaryRange: '$125 - $145 / hr ($5,000/wk) + $10,000 Sign-on',
-            sourceUrl: 'https://www.citadelsecurities.com/careers',
-            atsProvider: 'Workday',
-            postedAt: new Date(Date.now() - 1000 * 60 * 60 * 18).toISOString(),
-            daysOpen: 1,
-            urgencyLevel: 'CRITICAL_IMMEDIATE',
-            estimatedTimeToCloseDays: 14,
-            scores: {
-              finalScore: 0.94,
-              layer1StatedMatch: 0.96,
-              layer2RealityMatch: 0.92,
-              compensationScore: 1.0,
-              penaltyDeductions: 0.0,
-            },
-            keyMatchedSkills: ['C++20', 'CUDA', 'Lock-Free Data Structures', 'Linux Kernel', 'SIMD', 'TCP/IP'],
-            missingCriticalSkills: [],
-            oaDetails: {
-              platform: 'HackerRank (Proctored)',
-              dsaDifficulty: 'Hard (Codeforces 1900+ / Hard DP & Tree Graphs)',
-              focusAreas: ['Memory Layout & Cache Misses', 'Concurrency & Lock-Free Atomicity', 'Bit Manipulation'],
-            },
-            matchExplanation: '94% Match. Perfect alignment with Stanford CS systems background, C++20 order matching engine project, and Meta infra internship. Preferred Tier 1 Quant target.',
-            applicationStatus: 'APPLIED',
-            tailoringRecommendation: 'Emphasize your 800ns median latency benchmark and SIMD vectorized math routines in your project summary header.',
-          },
-          {
-            jobId: 'match-openai-research-eng',
-            title: 'Research Engineering Intern - Distributed Systems & GPU Kernels',
-            company: 'OpenAI',
-            companyTier: 'Tier 1 AI Labs',
-            location: 'San Francisco, CA',
-            locationType: 'Onsite',
-            salaryRange: '$85 - $110 / hr + $3,500/mo Housing',
-            sourceUrl: 'https://openai.com/careers',
-            atsProvider: 'Greenhouse',
-            postedAt: new Date(Date.now() - 1000 * 60 * 60 * 36).toISOString(),
-            daysOpen: 2,
-            urgencyLevel: 'CRITICAL_IMMEDIATE',
-            estimatedTimeToCloseDays: 18,
-            scores: {
-              finalScore: 0.91,
-              layer1StatedMatch: 0.93,
-              layer2RealityMatch: 0.89,
-              compensationScore: 0.95,
-              penaltyDeductions: 0.0,
-            },
-            keyMatchedSkills: ['CUDA', 'PyTorch', 'Distributed Systems', 'Python', 'C++'],
-            missingCriticalSkills: ['Triton DSL'],
-            oaDetails: {
-              platform: 'Take-home GPU Kernel / C++ Systems Practical',
-              dsaDifficulty: 'Hard Systems Practical (Triton / CUDA Kernel Optimization)',
-              focusAreas: ['Distributed Pretraining Pipeline', 'FP8 / BF16 Quantization', 'Megatron-style Tensor Parallelism'],
-            },
-            matchExplanation: '91% Match. Your GPU kernel sparse matrix research and high-scale C++ cache service match OpenAI distributed training requirements.',
-            applicationStatus: 'OA_RECEIVED',
-            tailoringRecommendation: 'Add a bullet highlighting your custom Triton/CUDA kernel benchmark and memory coalescing optimization.',
-          },
-          {
-            jobId: 'match-jane-street-swe',
-            title: 'Software Engineering Intern (Low-Latency & Functional Systems)',
-            company: 'Jane Street',
-            companyTier: 'Tier 1 Quant/HFT',
-            location: 'New York, NY',
-            locationType: 'Onsite',
-            salaryRange: '$120 - $135 / hr + Corporate Luxury Housing',
-            sourceUrl: 'https://www.janestreet.com/join-jane-street',
-            atsProvider: 'Ashby',
-            postedAt: new Date(Date.now() - 1000 * 60 * 60 * 48).toISOString(),
-            daysOpen: 2,
-            urgencyLevel: 'HIGH_ROLLING',
-            estimatedTimeToCloseDays: 16,
-            scores: {
-              finalScore: 0.88,
-              layer1StatedMatch: 0.86,
-              layer2RealityMatch: 0.91,
-              compensationScore: 1.0,
-              penaltyDeductions: 0.0,
-            },
-            keyMatchedSkills: ['Rust', 'Distributed Systems', 'Algorithms', 'TCP/IP', 'Linux'],
-            missingCriticalSkills: ['OCaml Functional Paradigms'],
-            oaDetails: {
-              platform: 'Live Pair Programming (CoderPad)',
-              dsaDifficulty: 'High Complexity Clean Code / In-memory Architecture Simulation',
-              focusAreas: ['State Machines', 'Type Safety & Invariant Guarantees', 'Deterministic Concurrency'],
-            },
-            matchExplanation: '88% Match. Excellent mathematical foundations and distributed consensus (Raft in Rust) experience. Jane Street assesses strong algorithmic clarity and systems architecture.',
-            applicationStatus: 'INTERVIEWING',
-            tailoringRecommendation: 'Highlight functional programming concepts from your Rust Raft consensus store to demonstrate type-safe architecture.',
-          },
-          {
-            jobId: 'match-databricks-dist-sys',
-            title: 'Distributed Storage & Compute Engine Intern',
-            company: 'Databricks',
-            companyTier: 'High-Growth Unicorn',
-            location: 'San Francisco, CA',
-            locationType: 'Hybrid',
-            salaryRange: '$75 - $95 / hr + Relocation Bonus',
-            sourceUrl: 'https://databricks.com/company/careers',
-            atsProvider: 'Greenhouse',
-            postedAt: new Date(Date.now() - 1000 * 60 * 60 * 72).toISOString(),
-            daysOpen: 3,
-            urgencyLevel: 'HIGH_ROLLING',
-            estimatedTimeToCloseDays: 24,
-            scores: {
-              finalScore: 0.86,
-              layer1StatedMatch: 0.89,
-              layer2RealityMatch: 0.84,
-              compensationScore: 0.88,
-              penaltyDeductions: 0.0,
-            },
-            keyMatchedSkills: ['C++', 'Rust', 'Distributed Systems', 'Linux', 'TCP/IP'],
-            missingCriticalSkills: ['Apache Spark / Photon Engine'],
-            oaDetails: {
-              platform: 'Codesignal General Coding Framework',
-              dsaDifficulty: 'Medium-Hard (Score 800+ required for screening pass)',
-              focusAreas: ['Distributed Hash Tables', 'Storage Partitioning', 'LSM-Tree Internals'],
-            },
-            matchExplanation: '86% Match. Strong distributed systems background directly maps to Spark Photon query engine team.',
-            applicationStatus: 'NEW_MATCH',
-            tailoringRecommendation: 'Detail your Raft consensus log compaction and disk serialization performance.',
-          },
-          {
-            jobId: 'match-anthropic-infra',
-            title: 'Systems & Infrastructure Intern - Large Scale Compute',
-            company: 'Anthropic',
-            companyTier: 'Tier 1 AI Labs',
-            location: 'San Francisco, CA',
-            locationType: 'Onsite',
-            salaryRange: '$90 - $115 / hr + Housing Allowance',
-            sourceUrl: 'https://jobs.ashbyhq.com/anthropic',
-            atsProvider: 'Ashby',
-            postedAt: new Date(Date.now() - 1000 * 60 * 60 * 96).toISOString(),
-            daysOpen: 4,
-            urgencyLevel: 'CRITICAL_IMMEDIATE',
-            estimatedTimeToCloseDays: 16,
-            scores: {
-              finalScore: 0.89,
-              layer1StatedMatch: 0.91,
-              layer2RealityMatch: 0.88,
-              compensationScore: 0.95,
-              penaltyDeductions: 0.0,
-            },
-            keyMatchedSkills: ['Python', 'CUDA', 'Distributed Systems', 'PyTorch', 'Linux Kernel'],
-            missingCriticalSkills: ['Kubernetes GPU Operator'],
-            oaDetails: {
-              platform: 'Custom Systems Takehome / Architecture Call',
-              dsaDifficulty: 'Distributed Fault-Tolerance & Memory Profiling',
-              focusAreas: ['Checkpoint Resumption', 'GPU Cluster Interconnect', 'RDMA / RoCE'],
-            },
-            matchExplanation: '89% Match. Superb fit for high-scale cluster orchestration and GPU memory caching.',
-            applicationStatus: 'NEW_MATCH',
-            tailoringRecommendation: 'Include your 1.2M QPS caching latency metrics and CUDA multi-GPU optimization highlights.',
-          },
-        ],
-        resumeComponentsSummary: {
-          resumeId: 'resume-alex-rivera-primary',
-          title: 'Alex Rivera - Primary Systems & Quant Resume 2026',
-          lastUpdated: new Date(Date.now() - 1000 * 60 * 60 * 5).toISOString(),
-          skillsCount: 11,
-          topSkills: ['C++', 'CUDA', 'Python', 'Rust', 'Distributed Systems', 'Low-Latency Networking', 'PyTorch', 'SIMD'],
-          projectsCount: 2,
-          experienceCount: 1,
-          embeddingsStatus: 'SYNCHRONIZED' as const,
-          subVectorDimensions: 768,
-        },
-        trackedCompanies: [
-          {
-            companyName: 'Citadel Securities',
-            tier: 'Tier 1 Quant/HFT',
-            activeJobsCount: 4,
-            realityBarSummary: 'Extremely high algorithmic & systems speed bar. 100% rolling review with top priority on day 1–3 applications.',
-            fastTrackTip: 'Apply within 24 hours of drop. Complete proctored HackerRank with 100% test cases and O(1)/O(N) memory efficiency.',
-            avgLifespanDays: 13,
-          },
-          {
-            companyName: 'OpenAI',
-            tier: 'Tier 1 AI Labs',
-            activeJobsCount: 3,
-            realityBarSummary: 'Values tangible systems artifacts (Triton kernels, custom PyTorch ops, CUDA speedups) over generic toy projects.',
-            fastTrackTip: 'Link public GitHub repo with reproducible benchmarks showing kernel latency reduction on GPU hardware.',
-            avgLifespanDays: 17,
-          },
-          {
-            companyName: 'Jane Street',
-            tier: 'Tier 1 Quant/HFT',
-            activeJobsCount: 5,
-            realityBarSummary: 'Tests deeply for clean state modeling, mathematical intuition, and functional thinking.',
-            fastTrackTip: 'Practice verbalizing architectural tradeoffs out loud during pair coding interviews.',
-            avgLifespanDays: 15,
-          },
-          {
-            companyName: 'Databricks',
-            tier: 'High-Growth Unicorn',
-            activeJobsCount: 6,
-            realityBarSummary: 'Standard CodeSignal 800+ OA screen followed by deep distributed storage & systems concurrency interview.',
-            fastTrackTip: 'Prepare LSM-Tree storage internals and multi-threaded lock-free queue concurrency problems.',
-            avgLifespanDays: 24,
-          },
-          {
-            companyName: 'Stripe',
-            tier: 'High-Growth Unicorn',
-            activeJobsCount: 5,
-            realityBarSummary: 'Practical bug squash and API integration interviews. Focuses heavily on production code quality & unit tests.',
-            fastTrackTip: 'Write comprehensive test assertions and handle all edge cases during practical coding.',
-            avgLifespanDays: 26,
-          },
-        ],
+        topMatches,
+        resumeComponentsSummary: primaryResume ? {
+          resumeId: primaryResume.id,
+          title: primaryResume.title,
+          lastUpdated: primaryResume.updatedAt,
+          skillsCount: primaryResume.extractedSkills.length,
+          topSkills: primaryResume.extractedSkills.slice(0, 8),
+          projectsCount: primaryResume.parsedData?.projects.length ?? 0,
+          experienceCount: primaryResume.parsedExperience.length,
+          embeddingsStatus: primaryResume.embedding.length > 0 ? 'SYNCHRONIZED' as const : 'PENDING_RECALCULATION' as const,
+          subVectorDimensions: primaryResume.embedding.length,
+        } : null,
+        trackedCompanies,
         systemMetrics: {
-          pipelineLatencyMs: 14.8,
-          scraperHealth: 'Operational (Greenhouse, Lever, Ashby, Workday)',
-          queuePendingTasks: 0,
-          activeRateLimitRpm: 30,
+          pipelineLatencyMs: null,
+          scraperHealth: 'Not measured',
+          queuePendingTasks: null,
+          activeRateLimitRpm: null,
         },
       };
 
@@ -2892,58 +3115,67 @@ async function startServer() {
     }
   });
 
-  // 5. Update Target Parameters & Recalculate
-  app.put('/api/dashboard/target-parameters', generalRateLimiter, (req, res) => {
-    try {
-      const {
-        targetLocations,
-        targetRoles,
-        preferredCompanies,
-        blacklistedCompanies,
-        customMatchThreshold,
-        alertMethod,
-        alertDestination,
-      } = req.body || {};
+  // 5. Save authenticated user preferences; overview refresh recalculates matches from these values.
+  app.put('/api/dashboard/target-parameters', generalRateLimiter, authenticateToken, (req: AuthenticatedRequest, res) => {
+    if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
 
-      res.json({
-        success: true,
-        message: 'Target criteria updated. Pipeline rescoring calibrated.',
-        updatedParameters: {
-          targetLocations: targetLocations || ['San Francisco, CA', 'New York, NY', 'Remote'],
-          targetRoles: targetRoles || ['Systems Engineer', 'Quant Developer'],
-          preferredCompanies: preferredCompanies || ['Citadel Securities', 'OpenAI'],
-          blacklistedCompanies: blacklistedCompanies || ['CryptoGambling Inc'],
-          customMatchThreshold: customMatchThreshold !== undefined ? Number(customMatchThreshold) : 0.72,
-          alertMethod: alertMethod || 'telegram',
-          alertDestination: alertDestination || '@alex_rivera_scout_bot',
-          updatedAt: new Date().toISOString(),
-        },
+    const user = db.getUserById(req.user.userId, req.user.tenantId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const parseResult = preferencesSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      return res.status(400).json({
+        error: 'Validation Error',
+        message: 'Invalid target preferences',
+        details: parseResult.error.flatten().fieldErrors,
       });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to update target parameters' });
     }
+
+    const updatedParameters = db.upsertPreferences({
+      userId: user.id,
+      tenantId: user.tenantId,
+      ...parseResult.data,
+    });
+    db.updateUser(user.id, { isOnboarded: true }, user.tenantId);
+    res.json({ success: true, updatedParameters });
   });
 
-  // 6. Update Application Status for Matched Job
-  app.put('/api/dashboard/match-status/:jobId', generalRateLimiter, (req, res) => {
-    try {
-      const { jobId } = req.params;
-      const { applicationStatus } = req.body;
+  // 6. Persist application status only for the authenticated user's saved match.
+  app.put('/api/dashboard/match-status/:jobId', generalRateLimiter, authenticateToken, (req: AuthenticatedRequest, res) => {
+    if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
 
-      res.json({
-        success: true,
-        jobId,
-        applicationStatus: applicationStatus || 'APPLIED',
-        updatedAt: new Date().toISOString(),
-      });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to update match application status' });
+    const parsedJobId = requestIdSchema.safeParse(req.params.jobId);
+    const parsedStatus = applicationStatusSchema.safeParse(req.body);
+    if (!parsedJobId.success || !parsedStatus.success) {
+      return res.status(400).json({ error: 'Validation Error', message: 'A valid job ID and application status are required.' });
     }
+
+    const updatedMatch = db.updateMatchApplicationStatus(
+      req.user.userId,
+      req.user.tenantId,
+      parsedJobId.data,
+      parsedStatus.data.applicationStatus
+    );
+    if (!updatedMatch) return res.status(404).json({ error: 'Match not found for this user' });
+
+    res.json({
+      success: true,
+      jobId: parsedJobId.data,
+      applicationStatus: updatedMatch.applicationStatus,
+      updatedAt: updatedMatch.updatedAt,
+    });
   });
 
-
-
-
+  app.use((error: unknown, _req: Request, res: express.Response, next: express.NextFunction) => {
+    if (res.headersSent) return next(error);
+    if (error && typeof error === 'object' && 'type' in error && error.type === 'entity.too.large') {
+      return res.status(413).json({ error: 'Request Too Large', message: 'The request exceeds the allowed size.' });
+    }
+    if (error instanceof SyntaxError && 'status' in error && error.status === 400) {
+      return res.status(400).json({ error: 'Malformed Request', message: 'Request body must contain valid JSON.' });
+    }
+    return next(error);
+  });
 
   // Vite middleware for development vs static serve for production
   if (process.env.NODE_ENV !== 'production') {
@@ -2955,14 +3187,28 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.get('/{*splat}', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`AI Internship Scout Server listening on http://0.0.0.0:${PORT}`);
   });
+
+  const shutdown = () => {
+    httpServer.close(() => {
+      void persistence.close().catch((error: unknown) => {
+        console.error('Failed to close PostgreSQL connection pool:', error);
+        process.exitCode = 1;
+      });
+    });
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
 }
 
-startServer();
+startServer().catch((error: unknown) => {
+  console.error('Server startup failed:', error);
+  process.exitCode = 1;
+});

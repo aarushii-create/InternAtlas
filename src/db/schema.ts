@@ -16,6 +16,7 @@ import {
   index,
   uniqueIndex,
   pgEnum,
+  smallint,
 } from 'drizzle-orm/pg-core';
 
 // Custom vector type definition for pgvector in Drizzle ORM
@@ -277,3 +278,13 @@ export const notifications = pgTable(
     tenantUserNotifIdx: index('idx_notifications_tenant_user').on(table.tenantId, table.userId),
   })
 );
+
+export const appRuntimeState = pgTable('app_runtime_state', {
+  id: smallint('id').primaryKey(),
+  state: jsonb('state').$type<{
+    version: number;
+    database: Record<string, unknown>;
+    feedback: Record<string, unknown>;
+  }>().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});

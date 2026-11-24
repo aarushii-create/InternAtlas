@@ -7,8 +7,10 @@
     "dev": "tsx server.ts",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "start": "node dist/server.cjs",
-    "clean": "rm -rf dist server.cjs",
-    "lint": "tsc --noEmit"
+    "db:migrate": "tsx src/db/migrate.ts",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "lint": "tsc --noEmit",
+    "test": "tsx --test tests/project.test.ts"
   },
   "overrides": {
     "qs": "6.16.0"
@@ -26,6 +28,7 @@
     "motion": "^12.23.24",
     "multer": "^2.2.0",
     "pdf-parse": "^2.4.5",
+    "pg": "^8.23.1",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "uuid": "^14.0.1",
@@ -39,6 +42,8 @@
     "@types/multer": "^2.2.0",
     "@types/node": "^22.14.0",
     "@types/pdf-parse": "^1.1.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "@types/uuid": "^11.0.0",
     "autoprefixer": "^10.4.21",
     "esbuild": "^0.25.0",

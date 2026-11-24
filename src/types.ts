@@ -32,6 +32,7 @@ export interface AuthResponse {
 
 export interface ParsedResumeData {
   skills: string[];
+  inferences?: string[];
   projects: {
     title: string;
     description: string;
@@ -102,6 +103,8 @@ export interface UserPreferences {
 export interface Job {
   id: string;
   source: 'greenhouse' | 'lever' | 'direct' | 'custom';
+  atsProvider?: string;
+  dataOrigin?: 'live' | 'demo' | 'manual';
   externalId: string;
   dedupHash: string; // SHA-256(company + title + location + direct_apply_url)
   company: string;
@@ -132,6 +135,18 @@ export interface Job {
   prefilterReason?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ScraperBoardHealth {
+  companyId: string;
+  company: string;
+  provider: string;
+  connectorStatus: 'supported' | 'unsupported';
+  verificationStatus: 'not_checked' | 'healthy' | 'empty' | 'failed' | 'unsupported';
+  lastAttemptAt?: string;
+  lastSuccessfulFetchAt?: string;
+  lastError?: string;
+  lastFetchedJobCount?: number;
 }
 
 export interface ArchivedJob extends Job {
@@ -427,6 +442,7 @@ export interface Match {
   layer1Details?: Layer1EvaluationResult;
   layer2Details?: Layer2EvaluationResult;
   status: 'pending' | 'alerted' | 'applied' | 'skipped';
+  applicationStatus?: ProductionJobMatch['applicationStatus'];
   userFeedback?: 'thumbs_up' | 'thumbs_down' | 'threshold_adjusted';
   createdAt: string;
   updatedAt: string;
@@ -1175,7 +1191,7 @@ export interface ModularProfileEmbeddings {
   totalProjectsCount: number;
   totalExperienceCount: number;
   lastPatchedAt: string;
-  lastDeltaType: DeltaUpdateType;
+  lastDeltaType: DeltaUpdateType | 'INITIALIZE';
   lastDeltaDescription: string;
 }
 
@@ -1483,16 +1499,17 @@ export interface ProductionJobMatch {
   salaryRange?: string;
   sourceUrl: string;
   atsProvider: string;
+  dataOrigin?: 'live' | 'demo' | 'manual';
   postedAt: string;
   daysOpen: number;
   urgencyLevel: 'CRITICAL_IMMEDIATE' | 'HIGH_ROLLING' | 'MODERATE' | 'STANDARD_CYCLE';
-  estimatedTimeToCloseDays: number;
+  estimatedTimeToCloseDays?: number;
   scores: {
     finalScore: number;
     layer1StatedMatch: number;
     layer2RealityMatch: number;
-    compensationScore: number;
-    penaltyDeductions: number;
+    compensationScore?: number;
+    penaltyDeductions?: number;
   };
   keyMatchedSkills: string[];
   missingCriticalSkills: string[];
@@ -1521,7 +1538,7 @@ export interface DashboardOverviewPayload {
     avgMatchScore: number;
     activeApplications: number;
     alertsDispatchedToday: number;
-    lastScrapeRunAt: string;
+    lastScrapeRunAt: string | null;
   };
   topMatches: ProductionJobMatch[];
   resumeComponentsSummary: {
@@ -1534,23 +1551,19 @@ export interface DashboardOverviewPayload {
     experienceCount: number;
     embeddingsStatus: 'SYNCHRONIZED' | 'PENDING_RECALCULATION';
     subVectorDimensions: number;
-  };
+  } | null;
   trackedCompanies: {
     companyName: string;
     tier: string;
     activeJobsCount: number;
     realityBarSummary: string;
     fastTrackTip: string;
-    avgLifespanDays: number;
+    avgLifespanDays?: number;
   }[];
   systemMetrics: {
-    pipelineLatencyMs: number;
+    pipelineLatencyMs: number | null;
     scraperHealth: string;
-    queuePendingTasks: number;
-    activeRateLimitRpm: number;
+    queuePendingTasks: number | null;
+    activeRateLimitRpm: number | null;
   };
 }
-
-
-
-

@@ -39,7 +39,9 @@ import { ResumeDeltaTestSuiteReport } from '../lib/resume/resumeDeltaTestSuite';
 import { safeFetchJson } from '../lib/apiHelper';
 
 export const ResumeEvolutionStudio: React.FC = () => {
-  const resumeId = 'res-11111111-1111-4111-a111-111111111111'; // Alex Rivera (Stanford CS)
+  const [resumeId, setResumeId] = useState<string>('');
+  const [selectedResume, setSelectedResume] = useState<Resume | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // State
   const [profile, setProfile] = useState<ModularProfileEmbeddings | null>(null);
@@ -65,7 +67,7 @@ export const ResumeEvolutionStudio: React.FC = () => {
   const [customExperience, setCustomExperience] = useState({
     company: '',
     role: '',
-    duration: 'Summer 2026',
+    duration: '',
     highlights: '',
     technologies: '',
   });
@@ -89,7 +91,8 @@ export const ResumeEvolutionStudio: React.FC = () => {
   const [testRunning, setTestRunning] = useState<boolean>(false);
 
   // Fetch modular profile & state
-  const loadModularData = async () => {
+  const loadModularData = async (targetResumeId: string) => {
+    if (!targetResumeId) return;
     setLoading(true);
     try {
       const dataRes = await safeFetchJson<{
@@ -97,7 +100,7 @@ export const ResumeEvolutionStudio: React.FC = () => {
         projects: ResumeProjectItem[];
         experiences: ResumeExperienceItem[];
         extractedSkills: string[];
-      }>(`/api/resume/modular-vectors/${resumeId}`);
+      }>(`/api/resume/modular-vectors/${targetResumeId}`);
 
       if (dataRes.ok && dataRes.data) {
         setProfile(dataRes.data.profile);
@@ -106,7 +109,7 @@ export const ResumeEvolutionStudio: React.FC = () => {
         setExtractedSkills(dataRes.data.extractedSkills);
       }
 
-      const auditRes = await safeFetchJson<DeltaAuditLogEntry[]>(`/api/resume/delta/audit/${resumeId}`);
+      const auditRes = await safeFetchJson<DeltaAuditLogEntry[]>(`/api/resume/delta/audit/${targetResumeId}`);
       if (auditRes.ok && auditRes.data) {
         setAuditLogs(auditRes.data);
       }
@@ -118,12 +121,30 @@ export const ResumeEvolutionStudio: React.FC = () => {
   };
 
   useEffect(() => {
-    loadModularData();
+    const loadResume = async () => {
+      try {
+        const response = await safeFetchJson<{ resumes: Resume[] }>('/api/resumes');
+        if (!response.ok || !response.data) throw new Error('Could not load saved resumes.');
+        const resumes = response.data.resumes;
+        const primaryResume = resumes.find((resume) => resume.isPrimary) || resumes[0];
+        if (!primaryResume) {
+          setSelectedResume(null);
+          setResumeId('');
+          return;
+        }
+        setSelectedResume(primaryResume);
+        setResumeId(primaryResume.id);
+        await loadModularData(primaryResume.id);
+      } catch (error) {
+        setLoadError(error instanceof Error ? error.message : 'Could not load saved resumes.');
+      }
+    };
+    void loadResume();
   }, []);
 
   // 1. Handle Skill Delta Injection
   const handleAddSkill = async (skill: string) => {
-    if (!skill.trim()) return;
+    if (!resumeId || !skill.trim()) return;
     setActionLoading(`skill-${skill}`);
     try {
       const res = await safeFetchJson<ResumeDeltaPatchResponse>('/api/resume/delta/skill', {
@@ -167,6 +188,7 @@ export const ResumeEvolutionStudio: React.FC = () => {
     metrics?: string;
     repoUrl?: string;
   }) => {
+    if (!resumeId) return;
     setActionLoading(`project-${projectData.title}`);
     try {
       const res = await safeFetchJson<ResumeDeltaPatchResponse>('/api/resume/delta/project', {
@@ -216,6 +238,7 @@ export const ResumeEvolutionStudio: React.FC = () => {
     highlights: string[];
     technologies: string[];
   }) => {
+    if (!resumeId) return;
     setActionLoading(`exp-${expData.company}`);
     try {
       const res = await safeFetchJson<ResumeDeltaPatchResponse>('/api/resume/delta/experience', {
@@ -248,7 +271,7 @@ export const ResumeEvolutionStudio: React.FC = () => {
           setExperiences(reloadRes.data.experiences);
         }
         // Reset form
-        setCustomExperience({ company: '', role: '', duration: 'Summer 2026', highlights: '', technologies: '' });
+        setCustomExperience({ company: '', role: '', duration: '', highlights: '', technologies: '' });
       }
     } catch (err) {
       console.error('Failed to patch experience delta', err);
@@ -259,6 +282,7 @@ export const ResumeEvolutionStudio: React.FC = () => {
 
   // Reset to Baseline v1
   const handleResetProfile = async () => {
+    if (!resumeId) return;
     try {
       const res = await safeFetchJson<{ success: boolean; profile: ModularProfileEmbeddings }>(
         `/api/resume/delta/reset/${resumeId}`,
@@ -268,10 +292,10 @@ export const ResumeEvolutionStudio: React.FC = () => {
         setProfile(res.data.profile);
         setLastMatchScoreDeltas(null);
         setLastNotification({
-          message: 'Resume modular embeddings successfully reset to baseline v1.',
+          message: 'Resume vectors reset to the saved resume data.',
           type: 'info',
         });
-        loadModularData();
+        loadModularData(resumeId);
       }
     } catch (err) {
       console.error('Failed to reset modular profile', err);
@@ -287,7 +311,7 @@ export const ResumeEvolutionStudio: React.FC = () => {
       });
       if (reportRes.ok && reportRes.data) {
         setTestReport(reportRes.data);
-        await loadModularData();
+        await loadModularData(resumeId);
       }
     } catch (err) {
       console.error('Failed to run resume delta test suite', err);
@@ -315,14 +339,14 @@ export const ResumeEvolutionStudio: React.FC = () => {
               Modular Resume Vector Patching & Delta Updates
             </h1>
             <p className="text-slate-400 text-sm mt-1 max-w-3xl">
-              Dynamically patches individual skills, projects, and experiences into sub-vector embeddings (<code className="text-emerald-400 font-mono">&lt;2ms</code>) without re-parsing entire resumes (<code className="text-rose-400 font-mono">&gt;750ms</code>). Re-indexes user vectors instantly for live background candidate matching.
+              Update the selected account resume's skill, project, and experience vectors using values you provide.
             </p>
           </div>
 
           <div className="flex items-center gap-3">
             <button
-              onClick={loadModularData}
-              disabled={loading}
+              onClick={() => loadModularData(resumeId)}
+              disabled={loading || !resumeId}
               className="px-3.5 py-2 bg-slate-800/80 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-xl border border-slate-700/60 transition-all flex items-center gap-2 shadow-sm"
               title="Refresh modular profile state"
             >
@@ -331,11 +355,12 @@ export const ResumeEvolutionStudio: React.FC = () => {
             </button>
             <button
               onClick={handleResetProfile}
+              disabled={!resumeId}
               className="px-3.5 py-2 bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 text-xs font-semibold rounded-xl border border-rose-500/30 transition-all flex items-center gap-2"
-              title="Reset profile back to baseline v1"
+              title="Reset profile to data from the saved resume"
             >
               <History className="w-3.5 h-3.5" />
-              Reset to v1
+              Reset to saved resume
             </button>
             <button
               onClick={handleRunTestSuite}
@@ -347,6 +372,17 @@ export const ResumeEvolutionStudio: React.FC = () => {
             </button>
           </div>
         </div>
+
+        {loadError && (
+          <div className="max-w-7xl mx-auto mb-5 rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-300">
+            {loadError}
+          </div>
+        )}
+        {!loading && !resumeId && (
+          <div className="max-w-7xl mx-auto mb-5 rounded-xl border border-slate-700 bg-slate-900 p-4 text-sm text-slate-300">
+            Save a resume to this account before using the resume evolution tools. No example candidate data is loaded.
+          </div>
+        )}
 
         {/* Live Notification Banner */}
         {lastNotification && (
@@ -383,17 +419,17 @@ export const ResumeEvolutionStudio: React.FC = () => {
           <div className="flex items-center justify-between mb-3">
             <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Modular Profile Version</span>
             <div className="w-8 h-8 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 font-mono font-black text-xs">
-              v{profile?.version || 1}
+              v{profile?.version ?? '—'}
             </div>
           </div>
           <div className="flex items-baseline gap-2">
-            <div className="text-3xl font-black text-white">v{profile?.version || 1}.0</div>
-            <span className="text-xs text-emerald-400 font-semibold">Active & Re-Indexed</span>
+            <div className="text-3xl font-black text-white">{profile ? `v${profile.version}.0` : '—'}</div>
+            <span className="text-xs text-emerald-400 font-semibold">{profile ? 'Active & Re-Indexed' : 'No profile'}</span>
           </div>
           <div className="mt-3 text-[11px] text-slate-400 flex items-center justify-between">
             <span>Last Patched:</span>
             <strong className="text-slate-300">
-              {profile ? new Date(profile.lastPatchedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'Ready'}
+              {profile ? new Date(profile.lastPatchedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'Not available'}
             </strong>
           </div>
         </div>
@@ -401,21 +437,21 @@ export const ResumeEvolutionStudio: React.FC = () => {
         {/* Metric 2: Incremental Latency & Speedup */}
         <div className="p-5 rounded-2xl bg-slate-900/90 border border-slate-800 shadow-xl">
           <div className="flex items-center justify-between mb-3">
-            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Patch vs Re-Parse Speed</span>
+            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Patch Processing</span>
             <div className="w-8 h-8 rounded-xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center text-cyan-400">
               <Zap className="w-4 h-4" />
             </div>
           </div>
           <div className="flex items-baseline gap-2">
             <div className="text-3xl font-black text-emerald-400">
-              {auditLogs.length > 0 ? `${auditLogs[0].processingLatencyMs}ms` : '1.8ms'}
+              {auditLogs.length > 0 ? `${auditLogs[0].processingLatencyMs}ms` : 'Not measured'}
             </div>
-            <span className="text-xs text-slate-400">vs 780ms Full</span>
+            <span className="text-xs text-slate-400">Last patch duration</span>
           </div>
           <div className="mt-3 text-[11px] text-slate-400 flex items-center justify-between">
-            <span>Acceleration:</span>
+            <span>Simulated re-parse comparison:</span>
             <strong className="text-cyan-300 font-mono">
-              {auditLogs.length > 0 ? auditLogs[0].speedupFactor : '433x faster'}
+              {auditLogs.length > 0 ? auditLogs[0].speedupFactor : 'No comparison'}
             </strong>
           </div>
         </div>
@@ -537,34 +573,9 @@ export const ResumeEvolutionStudio: React.FC = () => {
                   Instant Skill Delta Patching
                 </h3>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  Injects a single skill vector directly into the candidate's skills sub-vector (<code className="text-emerald-400">~1.5ms</code>).
+                  Add a skill only if it is present in the resume.
                 </p>
               </div>
-            </div>
-
-            {/* Quick Skill Presets */}
-            <div className="flex flex-wrap gap-2 mb-4">
-              {['Rust', 'CUDA', 'Apache Kafka', 'Go (Golang)', 'FlashAttention-2', 'Stochastic Calculus', 'PyTorch GPU Kernels', 'Raft Consensus'].map(
-                (preset) => {
-                  const alreadyHas = extractedSkills.some((s) => s.toLowerCase() === preset.toLowerCase());
-                  return (
-                    <button
-                      key={preset}
-                      onClick={() => handleAddSkill(preset)}
-                      disabled={alreadyHas || actionLoading !== null}
-                      className={`px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all ${
-                        alreadyHas
-                          ? 'bg-slate-800 text-slate-500 border border-slate-700/50 cursor-not-allowed'
-                          : 'bg-emerald-950/40 hover:bg-emerald-600 hover:text-white text-emerald-300 border border-emerald-500/40 shadow-sm'
-                      }`}
-                    >
-                      {alreadyHas ? <Check className="w-3 h-3 text-emerald-500" /> : <Plus className="w-3 h-3" />}
-                      {preset}
-                      {alreadyHas && <span className="text-[10px] text-slate-400">(In Profile)</span>}
-                    </button>
-                  );
-                }
-              )}
             </div>
 
             {/* Custom Skill Input */}
@@ -583,7 +594,7 @@ export const ResumeEvolutionStudio: React.FC = () => {
               />
               <button
                 onClick={() => handleAddSkill(newSkillInput)}
-                disabled={!newSkillInput.trim() || actionLoading !== null}
+                disabled={!resumeId || !newSkillInput.trim() || actionLoading !== null}
                 className="px-4 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 text-white text-xs font-bold rounded-xl shadow-md flex items-center gap-1.5 transition-all disabled:opacity-50"
               >
                 <Plus className="w-3.5 h-3.5" />
@@ -609,28 +620,6 @@ export const ResumeEvolutionStudio: React.FC = () => {
                 <p className="text-xs text-slate-400 mb-4">
                   Computes individual project embedding and merges with existing projects sub-space.
                 </p>
-
-                {/* Preset 1-Click Project */}
-                <div className="mb-4 p-3.5 rounded-xl bg-slate-950 border border-slate-800/80">
-                  <div className="text-xs font-bold text-white">Preset: High-Throughput Raft Distributed Consensus Engine</div>
-                  <div className="text-[11px] text-slate-400 mt-1">Tech: Rust, C++, Raft, gRPC • 250k tx/sec benchmark</div>
-                  <button
-                    onClick={() =>
-                      handleAddProject({
-                        title: 'High-Throughput Raft Distributed Consensus Engine',
-                        description: 'Engineered zero-copy network log replication in Rust & C++ with Byzantine fault tolerance.',
-                        technologies: ['Rust', 'C++', 'Raft', 'gRPC', 'Distributed Systems'],
-                        metrics: 'Processed 250,000 tx/sec with 1.4ms P99 failover recovery.',
-                        repoUrl: 'https://github.com/alexrivera/raft-engine',
-                      })
-                    }
-                    disabled={actionLoading !== null}
-                    className="mt-2.5 w-full py-2 bg-indigo-600/20 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/40 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-1.5"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    1-Click Inject Raft Consensus Project (~2ms)
-                  </button>
-                </div>
 
                 {/* Custom Project Form */}
                 <div className="space-y-2.5">
@@ -667,7 +656,7 @@ export const ResumeEvolutionStudio: React.FC = () => {
                     metrics: customProject.metrics,
                   })
                 }
-                disabled={!customProject.title.trim() || actionLoading !== null}
+                disabled={!resumeId || !customProject.title.trim() || actionLoading !== null}
                 className="mt-4 w-full py-2.5 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 text-white text-xs font-bold rounded-xl shadow-md flex items-center justify-center gap-1.5 transition-all disabled:opacity-50"
               >
                 <Plus className="w-3.5 h-3.5" />
@@ -690,31 +679,6 @@ export const ResumeEvolutionStudio: React.FC = () => {
                 <p className="text-xs text-slate-400 mb-4">
                   Updates experience sub-vector without touching education or past employment items.
                 </p>
-
-                {/* Preset 1-Click Experience */}
-                <div className="mb-4 p-3.5 rounded-xl bg-slate-950 border border-slate-800/80">
-                  <div className="text-xs font-bold text-white">Preset: AI Infrastructure Intern @ OpenAI</div>
-                  <div className="text-[11px] text-slate-400 mt-1">Role: SWE Intern • Highlights: PyTorch CUDA Training Clusters</div>
-                  <button
-                    onClick={() =>
-                      handleAddExperience({
-                        company: 'OpenAI',
-                        role: 'AI Infrastructure Intern',
-                        duration: 'Summer 2026',
-                        highlights: [
-                          'Accelerated PyTorch distributed training clusters with custom CUDA memory allocation kernels.',
-                          'Reduced GPU idle pipeline bubble latency by 32%.',
-                        ],
-                        technologies: ['PyTorch', 'CUDA', 'Python', 'Distributed Systems'],
-                      })
-                    }
-                    disabled={actionLoading !== null}
-                    className="mt-2.5 w-full py-2 bg-teal-600/20 hover:bg-teal-600 text-teal-300 hover:text-white border border-teal-500/40 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-1.5"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    1-Click Inject OpenAI Internship (~2ms)
-                  </button>
-                </div>
 
                 {/* Custom Experience Form */}
                 <div className="space-y-2.5">
@@ -754,7 +718,7 @@ export const ResumeEvolutionStudio: React.FC = () => {
                     technologies: customExperience.technologies.split(',').map((t) => t.trim()).filter(Boolean),
                   })
                 }
-                disabled={!customExperience.company.trim() || !customExperience.role.trim() || actionLoading !== null}
+                disabled={!resumeId || !customExperience.company.trim() || !customExperience.role.trim() || actionLoading !== null}
                 className="mt-4 w-full py-2.5 bg-gradient-to-r from-teal-600 to-emerald-600 hover:from-teal-500 text-white text-xs font-bold rounded-xl shadow-md flex items-center justify-center gap-1.5 transition-all disabled:opacity-50"
               >
                 <Plus className="w-3.5 h-3.5" />
@@ -867,12 +831,17 @@ export const ResumeEvolutionStudio: React.FC = () => {
                     Weight: 10%
                   </span>
                 </div>
-                <div className="text-[11px] text-slate-400">
-                  Static anchor background: Stanford University B.S. Computer Science (GPA 3.92, Class of 2026).
-                </div>
-                <div className="text-[11px] text-slate-300">
-                  • Coursework: Distributed Systems, Compilers, Machine Learning, OS, Algorithms
-                </div>
+                {selectedResume?.parsedData?.education?.length ? (
+                  selectedResume.parsedData.education.map((education, index) => (
+                    <div key={index} className="text-[11px] text-slate-300">
+                      {[education.degree, education.institution, education.graduationYear, education.gpa && `GPA ${education.gpa}`]
+                        .filter(Boolean)
+                        .join(' • ')}
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-[11px] text-slate-500">No education details were explicitly extracted from this resume.</div>
+                )}
               </div>
             </div>
           </div>
@@ -896,12 +865,7 @@ export const ResumeEvolutionStudio: React.FC = () => {
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {(lastMatchScoreDeltas || [
-                { benchmarkJobId: 'job-databricks-bench', benchmarkCompany: 'Databricks', priorScore: 82.5, newScore: 88.4, scoreDelta: 5.9 },
-                { benchmarkJobId: 'job-openai-bench', benchmarkCompany: 'OpenAI', priorScore: 78.1, newScore: 84.6, scoreDelta: 6.5 },
-                { benchmarkJobId: 'job-stripe-bench', benchmarkCompany: 'Stripe', priorScore: 85.0, newScore: 87.2, scoreDelta: 2.2 },
-                { benchmarkJobId: 'job-citadel-bench', benchmarkCompany: 'Citadel Securities', priorScore: 76.4, newScore: 81.0, scoreDelta: 4.6 },
-              ]).map((bench) => (
+              {lastMatchScoreDeltas?.map((bench) => (
                 <div
                   key={bench.benchmarkJobId}
                   className="p-4 rounded-xl bg-slate-950 border border-slate-800/80 flex items-center justify-between"
@@ -923,6 +887,11 @@ export const ResumeEvolutionStudio: React.FC = () => {
                   </div>
                 </div>
               ))}
+              {!lastMatchScoreDeltas?.length && (
+                <p className="col-span-full text-center text-xs text-slate-500">
+                  No before-and-after scores have been calculated for this resume yet.
+                </p>
+              )}
             </div>
           </div>
         </div>

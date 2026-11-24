@@ -1,20 +1,13 @@
-/**
- * InternAtlas - Dynamic Candidate Profile Manager
- * Manages runtime candidate profiles, local storage persistence, and dynamic user updates.
- */
-
 export interface CandidateExperience {
   company: string;
   role: string;
   period: string;
   bullets: string[];
-  technologies?: string[];
 }
 
 export interface CandidateProject {
   title: string;
   description: string;
-  bullets: string[];
   technologies: string[];
   repoUrl?: string;
 }
@@ -22,444 +15,231 @@ export interface CandidateProject {
 export interface CandidateProfile {
   id: string;
   name: string;
-  email: string;
   school: string;
   degree: string;
-  graduationYear: string;
   gpa: string;
+  email: string;
   primaryTrack: string;
   skills: string[];
   experience: CandidateExperience[];
   projects: CandidateProject[];
-  rawText?: string;
   isCustom: boolean;
   isPrimary: boolean;
   createdAt: string;
-  embeddingDimensions?: number;
 }
+
+const now = new Date().toISOString();
 
 export const PRESET_CANDIDATES: CandidateProfile[] = [
   {
-    id: 'candidate-alex-rivera',
+    id: 'preset-alex-rivera',
     name: 'Alex Rivera',
-    email: 'alex.rivera@stanford.edu',
     school: 'Stanford University',
-    degree: 'BS/MS in Computer Science (Class of 2026)',
-    graduationYear: '2026',
-    gpa: '3.94 / 4.00',
-    primaryTrack: 'Systems, Low-Latency & Quantitative Engineering',
+    degree: 'B.S. Computer Science',
+    gpa: '3.92',
+    email: 'alex.rivera@stanford.edu',
+    primaryTrack: 'Systems & AI Engineering',
     skills: [
-      'C++',
-      'CUDA',
       'Python',
-      'Rust',
+      'C++',
+      'TypeScript',
+      'React',
+      'Express',
+      'PyTorch',
       'Distributed Systems',
-      'Low-Latency Networking',
-      'PyTorch',
-      'Linux Kernel',
-      'TCP/IP',
-      'SIMD',
-      'Lock-Free Data Structures',
-      'pgvector',
-    ],
-    experience: [
-      {
-        company: 'Meta',
-        role: 'Software Engineering Intern (Infrastructure)',
-        period: 'Summer 2025',
-        bullets: [
-          'Built real-time cache invalidation pipeline in C++ processing 1.2M QPS with sub-millisecond p99 latency.',
-          'Optimized memory serialization using FlatBuffers to lower p99 latency to 420us.',
-        ],
-        technologies: ['C++', 'FlatBuffers', 'Linux Kernel', 'Distributed Systems'],
-      },
-      {
-        company: 'Stanford High-Performance Computing Lab',
-        role: 'Undergraduate Researcher',
-        period: '2024 - Present',
-        bullets: [
-          'Designed GPU kernel optimizer for sparse matrix multiplication using CUDA and C++20, reducing kernel latency by 38%.',
-          'Authored high-throughput vectorized SIMD routines for dense matrix cache-line alignment.',
-        ],
-        technologies: ['CUDA', 'C++20', 'SIMD', 'GPU Hardware'],
-      },
-    ],
-    projects: [
-      {
-        title: 'Distributed Raft Key-Value Store',
-        description: 'Fault-tolerant distributed log replication engine built in Rust.',
-        bullets: [
-          'Implemented leader election, log compaction, and snapshotting with 99.99% reliability under chaos testing.',
-          'Achieved 45,000 commits/sec using zero-allocation ring buffers and asynchronous tokio I/O.',
-        ],
-        technologies: ['Rust', 'Tokio', 'Distributed Consensus', 'Raft'],
-        repoUrl: 'https://github.com/alexrivera/raft-kv',
-      },
-      {
-        title: 'Microsecond HFT Order Matching Engine',
-        description: 'Limit order book matching engine in C++20 with deterministic lock-free ring buffers.',
-        bullets: [
-          'Benchmarked order book cross latency at 820ns median and 1.4us p99 under 500K msgs/sec.',
-          'Utilized memory pool pre-allocation and cache-line padded data structures to eliminate L1 cache thrashing.',
-        ],
-        technologies: ['C++20', 'Lock-Free', 'Low-Latency', 'POSIX Sockets'],
-        repoUrl: 'https://github.com/alexrivera/cpp-matching-engine',
-      },
-    ],
-    rawText: `Alex Rivera | alex.rivera@stanford.edu | Stanford CS 2026 (GPA 3.94)
-Track: Systems, Low-Latency & Quantitative Engineering
-Skills: C++, CUDA, Python, Rust, Distributed Systems, Low-Latency Networking, PyTorch, Linux Kernel, TCP/IP, SIMD, Lock-Free Data Structures.
-Experience:
-- Meta: Software Engineering Intern (Infrastructure) - Built real-time cache invalidation in C++ processing 1.2M QPS.
-- Stanford HPC Lab: GPU Kernel Optimizer for sparse matrix multiplication using CUDA and C++20.
-Projects:
-- Distributed Raft Key-Value Store in Rust with 45K commits/sec.
-- Microsecond HFT Order Matching Engine in C++20 with 820ns median latency.`,
-    isCustom: false,
-    isPrimary: true,
-    createdAt: '2026-08-20T10:00:00.000Z',
-    embeddingDimensions: 768,
-  },
-  {
-    id: 'candidate-jordan-chen',
-    name: 'Jordan Chen',
-    email: 'jordan.chen@berkeley.edu',
-    school: 'UC Berkeley',
-    degree: 'B.S. in Electrical Engineering & Computer Sciences (Class of 2026)',
-    graduationYear: '2026',
-    gpa: '3.88 / 4.00',
-    primaryTrack: 'AI/ML, Foundation Models & Deep Learning Infrastructure',
-    skills: [
-      'Python',
-      'PyTorch',
-      'CUDA',
-      'Transformers',
-      'HuggingFace',
-      'Triton',
-      'Distributed Pretraining',
-      'TensorFlow',
-      'FastAPI',
+      'SQL',
       'Docker',
-      'C++',
+      'Redis',
+      'RAG',
       'Vector Databases',
     ],
     experience: [
       {
-        company: 'OpenAI (Contributed / Open Source)',
-        role: 'AI Research Intern / Contributor',
+        company: 'Palantir Technologies',
+        role: 'Software Engineering Intern',
         period: 'Summer 2025',
         bullets: [
-          'Fine-tuned 7B parameter Transformer models for code generation, achieving a 14% improvement on HumanEval benchmark.',
-          'Implemented FlashAttention-2 GPU kernel integrations in PyTorch to cut training memory footprint by 35%.',
+          'Built a distributed query engine using C++ and PyTorch.',
+          'Contributed to a Linux kernel module.',
         ],
-        technologies: ['PyTorch', 'Transformers', 'CUDA', 'Triton'],
-      },
-      {
-        company: 'Berkeley AI Research (BAIR)',
-        role: 'Undergraduate AI Researcher',
-        period: '2024 - Present',
-        bullets: [
-          'Trained multi-modal diffusion pipelines with mixed precision FP8 / BF16 quantization on 32x H100 GPUs.',
-          'Published benchmark evaluations on LLM speculative decoding inference acceleration.',
-        ],
-        technologies: ['Python', 'PyTorch', 'Megatron-LM', 'Slurm'],
       },
     ],
     projects: [
       {
-        title: 'Speculative Decoding Engine for LLMs',
-        description: 'Accelerated autoregressive token generation using draft model speculative execution.',
-        bullets: [
-          'Achieved 2.8x speedup on LLaMA-3 8B inference on single NVIDIA RTX 4090.',
-          'Integrated custom Triton kernel for KV-cache tree verification.',
-        ],
-        technologies: ['Python', 'Triton', 'CUDA', 'vLLM'],
-        repoUrl: 'https://github.com/jordanchen/speculative-decode',
+        title: 'RAG Vector Database',
+        description: 'A vector retrieval project built with Rust.',
+        technologies: ['Rust', 'RAG', 'Vector Search'],
+      },
+      {
+        title: 'Multi-Tenant Microservices',
+        description: 'A multi-tenant service architecture built with Node.js and Express.',
+        technologies: ['Node.js', 'Express', 'Distributed Systems'],
       },
     ],
-    rawText: `Jordan Chen | jordan.chen@berkeley.edu | UC Berkeley EECS 2026 (GPA 3.88)
-Track: AI/ML, Foundation Models & Deep Learning Infrastructure
-Skills: Python, PyTorch, CUDA, Transformers, HuggingFace, Triton, Distributed Pretraining, FastAPI, Docker, C++, Vector DBs.
-Experience:
-- OpenAI Open Source: Fine-tuned 7B Transformers, FlashAttention-2 GPU kernel integrations.
-- BAIR: Trained multi-modal diffusion pipelines with FP8/BF16 quantization on 32x H100s.
-Projects:
-- Speculative Decoding Engine in Triton/CUDA with 2.8x inference speedup.`,
     isCustom: false,
-    isPrimary: false,
-    createdAt: '2026-08-21T10:00:00.000Z',
-    embeddingDimensions: 768,
+    isPrimary: true,
+    createdAt: now,
   },
   {
-    id: 'candidate-maya-patel',
-    name: 'Maya Patel',
-    email: 'maya.patel@iitb.ac.in',
-    school: 'IIT Bombay',
-    degree: 'B.Tech in Computer Science & Engineering (Class of 2026)',
-    graduationYear: '2026',
-    gpa: '3.96 / 4.00 (9.8/10)',
-    primaryTrack: 'High-Concurrency Backend & Distributed Cloud Systems',
+    id: 'preset-jordan-chen',
+    name: 'Jordan Chen',
+    school: 'University of California, Berkeley',
+    degree: 'B.S. Electrical Engineering and Computer Sciences',
+    gpa: 'Not provided',
+    email: 'jordan.chen@berkeley.edu',
+    primaryTrack: 'Quantitative Development',
     skills: [
-      'Go',
-      'Java',
-      'Spring Boot',
-      'Kafka',
-      'Kubernetes',
-      'PostgreSQL',
-      'Redis',
-      'gRPC',
-      'Distributed Systems',
-      'AWS',
-      'Docker',
-      'System Design',
-      'GraphQL',
+      'C++',
+      'Python',
+      'CUDA',
+      'Low-Latency Systems',
+      'Quantitative Finance',
+      'Linear Algebra',
+      'Stochastic Calculus',
+      'Order Books',
     ],
     experience: [
       {
-        company: 'Razorpay',
-        role: 'Backend Engineering Intern',
+        company: 'Citadel Securities',
+        role: 'Quantitative Research Intern',
         period: 'Summer 2025',
-        bullets: [
-          'Built high-throughput payment reconciliation service in Go processing 25,000 transactions/second with sub-50ms latency.',
-          'Migrated event-driven ledger architecture to Apache Kafka with exactly-once delivery guarantees.',
-        ],
-        technologies: ['Go', 'Kafka', 'PostgreSQL', 'Redis', 'Docker'],
-      },
-      {
-        company: 'Flipkart',
-        role: 'Software Engineering Intern',
-        period: 'Winter 2024',
-        bullets: [
-          'Optimized distributed inventory lock service using Redis Redlock and Lua scripts, eliminating race conditions during flash sales.',
-          'Reduced inventory checkout latency by 45% across Big Billion Days traffic spikes.',
-        ],
-        technologies: ['Java', 'Spring Boot', 'Redis', 'Kubernetes'],
+        bullets: ['Built a high-frequency order book simulator.'],
       },
     ],
-    projects: [
-      {
-        title: 'Distributed Transaction Coordinator (2PC / Sagas)',
-        description: 'High-availability two-phase commit transaction manager for microservices in Go.',
-        bullets: [
-          'Implemented distributed saga pattern with compensating transactions and dead-letter queue recovery.',
-          'Achieved 10,000 distributed state transitions/sec with zero orphaned transactions.',
-        ],
-        technologies: ['Go', 'gRPC', 'Protobuf', 'PostgreSQL', 'Docker'],
-        repoUrl: 'https://github.com/mayapatel/distributed-saga-coordinator',
-      },
-    ],
-    rawText: `Maya Patel | maya.patel@iitb.ac.in | IIT Bombay CSE 2026 (GPA 3.96 / 9.8)
-Track: High-Concurrency Backend & Distributed Cloud Systems
-Skills: Go, Java, Spring Boot, Kafka, Kubernetes, PostgreSQL, Redis, gRPC, Distributed Systems, AWS, Docker, System Design.
-Experience:
-- Razorpay: Backend Engineering Intern - Built 25K TPS payment reconciliation in Go with Kafka.
-- Flipkart: SWE Intern - Optimized distributed inventory lock with Redis Redlock for flash sales.
-Projects:
-- Distributed Transaction Coordinator in Go using 2PC and Sagas.`,
+    projects: [],
     isCustom: false,
     isPrimary: false,
-    createdAt: '2026-08-22T10:00:00.000Z',
-    embeddingDimensions: 768,
+    createdAt: now,
   },
 ];
 
 const LOCAL_STORAGE_KEY = 'intern_atlas_candidate_profiles_v1';
 const ACTIVE_CANDIDATE_ID_KEY = 'intern_atlas_active_candidate_id_v1';
+const DEFAULT_CANDIDATE_ID = PRESET_CANDIDATES[0].id;
 
-/**
- * Returns a blank candidate profile template for uninitialized sessions
- */
+function canUseLocalStorage(): boolean {
+  return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
+}
+
 export function createEmptyProfile(): CandidateProfile {
   return {
-    id: `candidate-user-${Date.now()}`,
+    id: '',
     name: '',
-    email: '',
     school: '',
     degree: '',
-    graduationYear: '',
     gpa: '',
-    primaryTrack: '',
+    email: '',
+    primaryTrack: 'Software Engineering',
     skills: [],
     experience: [],
     projects: [],
-    rawText: '',
     isCustom: true,
-    isPrimary: true,
+    isPrimary: false,
     createdAt: new Date().toISOString(),
-    embeddingDimensions: 768,
   };
 }
 
-/**
- * Reads stored profiles from local storage (combined with presets)
- */
 export function getStoredCandidateProfiles(): CandidateProfile[] {
+  if (!canUseLocalStorage()) return PRESET_CANDIDATES;
+
   try {
-    const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
+    const raw = window.localStorage.getItem(LOCAL_STORAGE_KEY);
     if (!raw) return PRESET_CANDIDATES;
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed) || parsed.length === 0) return PRESET_CANDIDATES;
-    const customProfiles: CandidateProfile[] = parsed.filter((p: CandidateProfile) => p.isCustom);
-    return [...PRESET_CANDIDATES, ...customProfiles];
-  } catch (err) {
+
+    const stored = JSON.parse(raw) as CandidateProfile[];
+    if (!Array.isArray(stored)) return PRESET_CANDIDATES;
+
+    const savedById = new Map(stored.map((profile) => [profile.id, profile]));
+    const presets = PRESET_CANDIDATES.map((profile) => savedById.get(profile.id) ?? profile);
+    const customs = stored.filter(
+      (profile) => profile.isCustom && !PRESET_CANDIDATES.some((preset) => preset.id === profile.id)
+    );
+    return [...presets, ...customs];
+  } catch (error) {
+    console.error('Unable to read saved candidate profiles:', error);
     return PRESET_CANDIDATES;
   }
 }
 
-/**
- * Saves candidate profiles to local storage
- */
 export function saveCandidateProfiles(profiles: CandidateProfile[]): void {
+  if (!canUseLocalStorage()) return;
+
   try {
-    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(profiles));
-  } catch (err) {
-    console.error('Error persisting candidate profile state:', err);
+    window.localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(profiles));
+  } catch (error) {
+    console.error('Unable to save candidate profiles:', error);
   }
 }
 
-/**
- * Gets the active candidate profile dynamically
- */
 export function getActiveCandidateProfile(): CandidateProfile {
-  try {
-    const all = getStoredCandidateProfiles();
-    const activeId = localStorage.getItem(ACTIVE_CANDIDATE_ID_KEY);
-
-    if (activeId && all.length > 0) {
-      const found = all.find((c) => c.id === activeId);
-      if (found) return found;
-    }
-
-    const primary = all.find((c) => c.isPrimary);
-    return primary || all[0] || PRESET_CANDIDATES[0];
-  } catch (err) {
-    return PRESET_CANDIDATES[0] || createEmptyProfile();
+  const profiles = getStoredCandidateProfiles();
+  if (canUseLocalStorage()) {
+    const activeId = window.localStorage.getItem(ACTIVE_CANDIDATE_ID_KEY);
+    const active = profiles.find((profile) => profile.id === activeId);
+    if (active) return active;
   }
+  return profiles.find((profile) => profile.isPrimary) ?? profiles[0] ?? PRESET_CANDIDATES[0];
 }
 
-/**
- * Sets the active candidate profile
- */
 export function setActiveCandidateProfile(candidateId: string): CandidateProfile {
-  try {
-    localStorage.setItem(ACTIVE_CANDIDATE_ID_KEY, candidateId);
-    const all = getStoredCandidateProfiles();
-    const updated = all.map((c) => ({
-      ...c,
-      isPrimary: c.id === candidateId,
-    }));
-    saveCandidateProfiles(updated);
-    const active = updated.find((c) => c.id === candidateId);
-    return active || updated[0] || PRESET_CANDIDATES[0];
-  } catch (err) {
-    console.error('Error setting active candidate profile:', err);
-    return PRESET_CANDIDATES[0];
+  const profiles = getStoredCandidateProfiles();
+  const selected = profiles.find((profile) => profile.id === candidateId);
+  if (!selected) {
+    throw new Error(`Candidate profile "${candidateId}" was not found.`);
   }
+  if (canUseLocalStorage()) {
+    window.localStorage.setItem(ACTIVE_CANDIDATE_ID_KEY, candidateId);
+  }
+  return selected;
 }
 
-/**
- * Adds a new custom candidate profile
- */
-export function addCustomCandidateProfile(newProfile: Omit<CandidateProfile, 'id' | 'createdAt' | 'isCustom'>): CandidateProfile {
-  const all = getStoredCandidateProfiles();
-  const id = `custom-candidate-${Date.now()}`;
+export function addCustomCandidateProfile(
+  newProfile: Omit<CandidateProfile, 'id' | 'createdAt' | 'isCustom'>
+): CandidateProfile {
+  const profiles = getStoredCandidateProfiles();
   const profile: CandidateProfile = {
     ...newProfile,
-    id,
+    id: `custom-candidate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     isCustom: true,
-    isPrimary: true,
+    isPrimary: false,
     createdAt: new Date().toISOString(),
-    embeddingDimensions: 768,
   };
-
-  // Set new profile as primary
-  const updated = all.map((c) => ({ ...c, isPrimary: false }));
-  updated.push(profile);
-
-  saveCandidateProfiles(updated);
-  localStorage.setItem(ACTIVE_CANDIDATE_ID_KEY, id);
-
+  saveCandidateProfiles([...profiles, profile]);
+  if (canUseLocalStorage()) {
+    window.localStorage.setItem(ACTIVE_CANDIDATE_ID_KEY, profile.id);
+  }
   return profile;
 }
 
-/**
- * Updates an existing candidate profile
- */
-export function updateCandidateProfile(id: string, updates: Partial<CandidateProfile>): CandidateProfile | null {
-  const all = getStoredCandidateProfiles();
-  const idx = all.findIndex((c) => c.id === id);
-  if (idx === -1) return null;
+export function updateCandidateProfile(
+  id: string,
+  updates: Partial<CandidateProfile>
+): CandidateProfile | null {
+  const profiles = getStoredCandidateProfiles();
+  const index = profiles.findIndex((profile) => profile.id === id);
+  if (index < 0) return null;
 
-  all[idx] = {
-    ...all[idx],
+  const updated = {
+    ...profiles[index],
     ...updates,
+    id: profiles[index].id,
+    createdAt: profiles[index].createdAt,
   };
-
-  saveCandidateProfiles(all);
-  return all[idx];
+  const nextProfiles = [...profiles];
+  nextProfiles[index] = updated;
+  saveCandidateProfiles(nextProfiles);
+  return updated;
 }
 
-/**
- * Deletes a custom candidate profile
- */
 export function deleteCustomCandidateProfile(id: string): CandidateProfile {
-  const all = getStoredCandidateProfiles();
-  const filtered = all.filter((c) => c.id !== id || !c.isCustom);
-  saveCandidateProfiles(filtered);
+  const profiles = getStoredCandidateProfiles();
+  const target = profiles.find((profile) => profile.id === id);
+  if (!target || !target.isCustom) return getActiveCandidateProfile();
 
-  // If deleted candidate was active, reset to default
-  const activeId = localStorage.getItem(ACTIVE_CANDIDATE_ID_KEY);
-  if (activeId === id) {
-    localStorage.setItem(ACTIVE_CANDIDATE_ID_KEY, PRESET_CANDIDATES[0].id);
-    return PRESET_CANDIDATES[0];
+  const remaining = profiles.filter((profile) => profile.id !== id);
+  saveCandidateProfiles(remaining);
+  if (canUseLocalStorage() && window.localStorage.getItem(ACTIVE_CANDIDATE_ID_KEY) === id) {
+    window.localStorage.setItem(ACTIVE_CANDIDATE_ID_KEY, DEFAULT_CANDIDATE_ID);
   }
-
-  return getActiveCandidateProfile();
-}
-
-/**
- * Sets or creates the primary candidate profile dynamically
- */
-export function saveOrUpdateActiveProfile(profile: Partial<CandidateProfile>): CandidateProfile {
-  const all = getStoredCandidateProfiles();
-  const activeId = localStorage.getItem(ACTIVE_CANDIDATE_ID_KEY);
-
-  let existingIndex = -1;
-  if (activeId) {
-    existingIndex = all.findIndex((c) => c.id === activeId);
-  }
-
-  let updatedProfile: CandidateProfile;
-
-  if (existingIndex >= 0) {
-    updatedProfile = {
-      ...all[existingIndex],
-      ...profile,
-    };
-    all[existingIndex] = updatedProfile;
-  } else {
-    updatedProfile = {
-      ...createEmptyProfile(),
-      ...profile,
-      isPrimary: true,
-    };
-    all.push(updatedProfile);
-  }
-
-  saveCandidateProfiles(all);
-  localStorage.setItem(ACTIVE_CANDIDATE_ID_KEY, updatedProfile.id);
-
-  return updatedProfile;
-}
-
-/**
- * Deletes the active candidate profile and resets state
- */
-export function clearActiveProfile(): void {
-  try {
-    localStorage.removeItem(LOCAL_STORAGE_KEY);
-    localStorage.removeItem(ACTIVE_CANDIDATE_ID_KEY);
-  } catch (err) {
-    console.error('Error resetting candidate state:', err);
-  }
+  return remaining.find((profile) => profile.id === DEFAULT_CANDIDATE_ID) ?? PRESET_CANDIDATES[0];
 }
