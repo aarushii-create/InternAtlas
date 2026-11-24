@@ -610,10 +610,9 @@ export const CommandCenterView: React.FC<CommandCenterViewProps> = ({
       {/* Slide-in Detailed Job Drawer */}
       {selectedJob && (
         <JobDetailDrawer
-          job={selectedJob}
+          match={selectedJob}
           onClose={() => setSelectedJob(null)}
           onUpdateStatus={onUpdateStatus}
-          onOpenResume={onOpenResumeIntelligence}
         />
       )}
     </div>

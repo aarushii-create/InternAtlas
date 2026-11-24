@@ -293,7 +293,11 @@ export default function App() {
             )}
 
             {activeTab === 'dev-sandbox' && (
-              <DevSandboxView />
+              <DevSandboxView
+                currentTenant={currentTenant}
+                currentUser={currentUser}
+                authToken={authToken}
+              />
             )}
           </div>
         </main>

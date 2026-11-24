@@ -30,6 +30,8 @@ import {
   E2ETestSuiteSummary,
   E2EPipelineExecutionTrace,
   E2ELoadStressBenchmark,
+  TenantContext,
+  User,
 } from '../../types';
 
 // Import existing Phase Studio components for seamless tabbed access in Dev Sandbox
@@ -47,7 +49,17 @@ import { SchemaViewer } from '../SchemaViewer';
 import { AuthSecurityCenter } from '../AuthSecurityCenter';
 import { ApiPlayground } from '../ApiPlayground';
 
-export const DevSandboxView: React.FC = () => {
+interface DevSandboxViewProps {
+  currentTenant: TenantContext;
+  currentUser: User | null;
+  authToken: string | null;
+}
+
+export const DevSandboxView: React.FC<DevSandboxViewProps> = ({
+  currentTenant,
+  currentUser,
+  authToken,
+}) => {
   const [activeCategory, setActiveCategory] = useState<
     'e2e-benchmarks' | 'pipeline-sim' | 'rag-scoring' | 'scrapers-dedup' | 'knowledge-graph' | 'queue-cleanup' | 'database-api'
   >('e2e-benchmarks');
@@ -78,6 +90,17 @@ export const DevSandboxView: React.FC = () => {
   const [simSalary, setSimSalary] = useState<string>('$125/hr + $10,000 Sign-on');
   const [simulating, setSimulating] = useState<boolean>(false);
   const [liveTrace, setLiveTrace] = useState<E2EPipelineExecutionTrace | null>(null);
+
+  const handleRunMigration = async (): Promise<void> => {
+    throw new Error('Migrations run automatically at server startup. To apply them manually, run `npm run db:migrate`.');
+  };
+
+  const handleSeedData = async (): Promise<void> => {
+    const response = await fetch('/api/db/seed', { method: 'POST' });
+    if (!response.ok) {
+      throw new Error(`Database seeding failed with HTTP ${response.status}.`);
+    }
+  };
 
   // Run E2E Test Suite
   const handleRunTestSuite = async () => {
@@ -576,10 +599,12 @@ export const DevSandboxView: React.FC = () => {
             ))}
           </div>
 
-          {dbSubTab === 'explorer' && <DataExplorer />}
-          {dbSubTab === 'schema' && <SchemaViewer />}
-          {dbSubTab === 'security' && <AuthSecurityCenter />}
-          {dbSubTab === 'api' && <ApiPlayground />}
+          {dbSubTab === 'explorer' && <DataExplorer currentTenant={currentTenant} />}
+          {dbSubTab === 'schema' && (
+            <SchemaViewer onRunMigration={handleRunMigration} onSeedData={handleSeedData} />
+          )}
+          {dbSubTab === 'security' && <AuthSecurityCenter user={currentUser} token={authToken} />}
+          {dbSubTab === 'api' && <ApiPlayground currentTenant={currentTenant} />}
         </div>
       )}
     </div>
